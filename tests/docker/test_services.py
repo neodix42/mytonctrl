@@ -84,7 +84,7 @@ Restart = always
         spec_path = self.directory / "service.json"
         spec_path.write_text(json.dumps(spec))
         result = subprocess.run([sys.executable, str(RUNNER), str(spec_path)], text=True, capture_output=True, check=True,
-                                env=os.environ | {"XDG_DATA_HOME": "/wrong/user/data"})
+                                env={**os.environ, "XDG_DATA_HOME": "/wrong/user/data"})
         self.assertTrue(marker.is_file())
         self.assertFalse((self.directory / "unexpected").exists())
         self.assertEqual(json.loads(result.stdout), [["$(touch unexpected)", "$HOME", "a;b"], "some value", str(self.directory),
@@ -131,7 +131,8 @@ class SupervisorLifecycleTests(unittest.TestCase):
         for directory in (self.units, self.enabled, self.configs):
             directory.mkdir()
         self.socket = self.directory / "supervisor.sock"
-        self.environment = os.environ | {
+        self.environment = {
+            **os.environ,
             "MYTONCTRL_SERVICE_UNIT_DIR": str(self.units),
             "MYTONCTRL_SERVICE_ENABLED_DIR": str(self.enabled),
             "MYTONCTRL_SUPERVISOR_CONFIG_DIR": str(self.configs),

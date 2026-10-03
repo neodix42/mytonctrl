@@ -46,7 +46,7 @@ class UnixTransport(xmlrpc.client.Transport):
 
 
 def service_name(value):
-    name = value.removesuffix(".service")
+    name = value[:-8] if value.endswith(".service") else value
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@-]*", name):
         raise ValueError(f"Invalid service name: {value}")
     return name
