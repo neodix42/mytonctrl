@@ -1,0 +1,36 @@
+services:
+  ton-binaries:
+    image: ${TON_IMAGE:-ghcr.io/ton-blockchain/ton:latest}
+    # Publish artifacts only. Never run TON's docker/init.sh.
+    entrypoint: ["/bin/sh", "/scripts/export-ton.sh"]
+    environment:
+      TON_IMAGE_REF: ${TON_IMAGE:-ghcr.io/ton-blockchain/ton:latest}
+    volumes:
+      - ton-artifacts:/ton-artifacts
+      - ./docker/export-ton.sh:/scripts/export-ton.sh:ro
+    restart: "no"
+
+  mytonctrl:
+    image: ${MYTONCTRL_IMAGE:-mytonctrl:local}
+    build:
+      context: .
+      args:
+        MYTONCTRL_COMMIT: ${MYTONCTRL_BUILD_COMMIT:-unknown}
+        MYTONCTRL_VERSION: ${MYTONCTRL_BUILD_VERSION:-unknown}
+    env_file: ${MYTONCTRL_ENV_FILE:-.env}
+    volumes:
+      - ton-artifacts:/ton-artifacts:ro
+      - ton-work:/var/ton-work
+    depends_on:
+      ton-binaries:
+        condition: service_completed_successfully
+    # TON advertises PUBLIC_IP and listens on the ports selected in .env.
+    network_mode: host
+    stop_grace_period: 75s
+    restart: unless-stopped
+
+volumes:
+  ton-artifacts:
+    name: ${TON_ARTIFACTS_VOLUME:-mytonctrl-ton-artifacts}
+  ton-work:
+    name: ${TON_WORK_VOLUME:-mytonctrl-ton-work}

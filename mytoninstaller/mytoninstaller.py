@@ -14,7 +14,7 @@ from mypyconsole.mypyconsole import MyPyConsole
 from mytoncore.models import BlockHead, Paths
 from mytoncore.mytoncore import MyTonCore
 from mytoncore.utils import get_package_resource_path
-from mytonctrl.utils import get_current_user
+from mytonctrl.utils import get_current_user, is_container
 
 from mytoninstaller.config import get_ls_proxy_config, get_own_ip
 from mytoninstaller.node_args import get_node_args, set_node_argument
@@ -108,6 +108,8 @@ class InstallerCtrl:
 			color_print("{red}Bad args. Usage:{endc} enable <mode-name>")
 			return
 		name = args[0]
+		if is_container() and name in ("THA", "LSP"):
+			raise RuntimeError(f"{name} is installed separately in container deployments. The controller image does not install packages or compile add-ons.")
 		if name == "DS":
 			with get_package_resource_path('mytoninstaller.scripts', 'dht_server.py') as script_path:
 				run_as_root([sys.executable, str(script_path), self._validator_user, str(self._paths.ton_bin), str(self._paths.global_config_path)])
@@ -146,6 +148,8 @@ class InstallerCtrl:
 		print(json.dumps(data.json(), indent=4))
 
 	def enable_ton_http_api(self, update: bool = False):
+		if is_container():
+			return
 		try:
 			if update or not tha_exists():
 				self.do_enable_ton_http_api()
@@ -154,6 +158,8 @@ class InstallerCtrl:
 			pass
 
 	def do_enable_ton_http_api(self):
+		if is_container():
+			raise RuntimeError("Run ton-http-api in a separate container; this controller image does not install or update it.")
 		self.local.add_log("start do_enable_ton_http_api function", "debug")
 		if not os.path.exists(self._paths.local_config_path):
 			self.create_local_config_file([])
