@@ -171,8 +171,9 @@ Compose reads `.env` and passes it to the controller. Standalone Docker uses
 `--env-file .env`. Values are parsed as data; the entrypoint never sources or
 evaluates the file. Put the original installation flags in `MYTONCTRL_ARGS`,
 with shell-style quoting for values containing spaces. See the
-[installation option table](../README.md#installation-options) for all host
-options and their Docker equivalents.
+[host installation option table](../README.md#installation-options) for the
+original flags and [Docker arguments](../README.md#installation-arguments-in-env)
+for their container behavior.
 
 The default installs a mainnet validator using a prepared dump:
 

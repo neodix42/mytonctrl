@@ -6,11 +6,9 @@ MyTonCtrl is a console application that is used for launching and managing TON b
 
 The extended documentation can be found at https://docs.ton.org/v3/documentation/nodes/mytonctrl/overview and https://docs.ton.org/v3/guidelines/nodes/overview.
 
-For a controller Docker image that consumes mounted binaries from a separate
-official TON image, see [Docker setup](docker/README.md). The repository includes
-a `Dockerfile`, `.env.example`, and optional `compose.yaml`.
+## Host installation
 
-## Operating Systems
+### Operating systems
 
 It is recommended to use Ubuntu 22.04 LTS or Ubuntu 24.04 LTS for using MyTonCtrl. However, the full list of tested OS is below:
 
@@ -24,11 +22,8 @@ It is recommended to use Ubuntu 22.04 LTS or Ubuntu 24.04 LTS for using MyTonCtr
 | Debian 12        | OK            |
 | Debian 13        | Not supported |
 
-## Installation
-Please note that during the installation and upgrade procedures, MyTonCtrl will need to escalate privileges using the `sudo` or `su` methods in order to upgrade / install system wide components. Depending on your environment, you may be prompted to enter the password for the root or sudo user.
-
-
 ### Modes
+
 MyTonCtrl supports these installation modes:
 
 - `liteserver` - run the node as a liteserver only
@@ -45,6 +40,9 @@ You can change enabled modes later after installation.
 Learn more about node types: https://docs.ton.org/v3/documentation/nodes/overview
 
 ### Install
+
+Installation and upgrades use `sudo` or `su` to install system components. You
+may be prompted for the root or sudo user's password.
 
 1. Download installation script:
 	```shell
@@ -69,62 +67,54 @@ To view all available installation options use `bash install.sh --help`
 
 ### Installation options
 
-Pass these options to `sudo bash install.sh` for a host installation. For Docker,
-put installation options in `.env` as `MYTONCTRL_ARGS`; the default is:
+Pass these options directly to `sudo bash install.sh`. For example:
 
-```dotenv
-MYTONCTRL_ARGS=-m validator -n mainnet -d
-PUBLIC_IP=
+```sh
+sudo bash install.sh -m validator -n mainnet -d
 ```
 
-Blank or omitted `PUBLIC_IP` makes Docker autodetect the node's public IPv4
-address. Set it explicitly when the advertised address differs, such as behind
-NAT. The entrypoint validates the address before installation begins. Docker
-installation options apply when initializing an empty TON work volume. See
-[Docker setup](docker/README.md) for image selection, mounts and updates.
-
-| Original installation option | Host installer behavior | Docker equivalent |
-| --- | --- | --- |
-| `-m`, `--mode MODE` | Select any mode listed above; omitting it opens the interactive installer. | `-m validator` in `MYTONCTRL_ARGS`; all existing modes are supported. |
-| `-n`, `--network NETWORK` | Select `mainnet` (default) or `testnet`. | `-n mainnet`, `-n testnet`, or `-n custom` in `MYTONCTRL_ARGS`. |
-| `-c`, `--config URL` | Use a custom global network configuration URL. | `-c URL` or `-c /mounted/global.config.json` in `MYTONCTRL_ARGS`; mount local files read-only. |
-| `-u`, `--user USER` | Select the account used for MyTonCtrl. | `-u USER` in `MYTONCTRL_ARGS` (default `root`); the entrypoint runs as root and controller services use the selected account. |
-| `-t`, `--telemetry` | Disable telemetry. | `-t` in `MYTONCTRL_ARGS`. |
-| `-i`, `--ignore-reqs` | Skip the minimum CPU and RAM check. | `-i` in `MYTONCTRL_ARGS`. |
-| `-d`, `--dump` | Download a prepared dump to reduce initial synchronization time. | `-d` in `MYTONCTRL_ARGS` (enabled in `.env.example`). |
-| `--archive` | Install a full archive liteserver; requires `-m liteserver`. | `-m liteserver --archive` in `MYTONCTRL_ARGS`; also supply a prebuilt `tonutils-storage` binary. |
-| `-o`, `--only-mtc` | Install only MyTonCtrl; requires `-p`. | `-o -p /mounted/backup.tar.gz` in `MYTONCTRL_ARGS`. |
-| `-l`, `--only-node` | Install only the TON node. | `-l` in `MYTONCTRL_ARGS`. |
-| `-p`, `--backup PATH` | Restore installation settings from a backup. | `-p /mounted/backup.tar.gz` in `MYTONCTRL_ARGS`; mount the backup. |
-| `-B`, `--bin-dir PATH` | Select the binary directory (default `/usr/bin` on Linux). | `-B PATH` in `MYTONCTRL_ARGS`; a writable compatibility layout points to the mounted TON binaries. |
-| `-S`, `--src-dir PATH` | Select the source directory (default `/usr/src` on Linux). | `-S PATH` in `MYTONCTRL_ARGS`; used for Fift resources without a TON repository. |
-| `-W`, `--ton-work-dir PATH` | Select the node's work directory (default `/var/ton-work`). | `-W PATH` in `MYTONCTRL_ARGS`; Compose keeps data in its `/var/ton-work` volume through a path alias. |
-| `-e`, `--env-file PATH` | Read installation environment variables from a file. | Docker `--env-file .env`, Compose `env_file`, or `-e /mounted/installer.env` in `MYTONCTRL_ARGS` for native parameters. |
-| `-a`/`-r`/`-b`, `--author`/`--repo`/`--branch` | Select the MyTonCtrl GitHub owner, repository and branch. | Build the chosen checkout or select `MYTONCTRL_IMAGE`; runtime source selection is unavailable. |
-| `-g`/`-v`, `--node-repo`/`--node-version` | Select the TON repository and commit, branch or tag to build. | Select `TON_IMAGE`; its binaries are mounted separately. |
-| `--print-env` | Show the interactive installer's selected command and environment without installing. | `--print-env` in `MYTONCTRL_ARGS` prints the parsed installation configuration and exits. |
-| `-h`, `--help` | Print installation help. | `--help` in `MYTONCTRL_ARGS` prints Docker installation help and exits. |
-
-The Docker-only `-s`, `--no-startup-checks` option in `MYTONCTRL_ARGS` disables
-console startup checks. `-i` skips installation hardware checks; it does not
-disable console startup checks. The installer's `-c` selects the network
-configuration, while the interactive `mytonctrl -c` option selects its database.
+| Installation option | Description |
+| --- | --- |
+| `-m`, `--mode MODE` | Select a mode listed above. Omitting both mode and backup opens the interactive installer. |
+| `-n`, `--network NETWORK` | Select `mainnet` (default) or `testnet`. For a custom network, supply its configuration with `-c URL`. |
+| `-c`, `--config URL` | Use a custom global network configuration URL when installing TON. |
+| `-u`, `--user USER` | Select the MyTonCtrl account; defaults to the invoking account. The TON node runs as `validator`. |
+| `-t`, `--telemetry` | Disable telemetry. |
+| `-i`, `--ignore-reqs` | Skip the minimum CPU and RAM check. |
+| `-d`, `--dump` | Download a prepared dump to reduce initial synchronization time. |
+| `--archive` | Install a full archive liteserver; requires `-m liteserver`. |
+| `-o`, `--only-mtc` | Configure MyTonCtrl for an existing node using a backup; requires `-p`. |
+| `-l`, `--only-node` | Configure node operation with a separate controller and export a backup. |
+| `-p`, `--backup PATH` | Restore an installation from a backup. |
+| `-B`, `--bin-dir PATH` | Select the binary directory (default `/usr/bin` on Linux). |
+| `-S`, `--src-dir PATH` | Select the source directory (default `/usr/src` on Linux). |
+| `-W`, `--ton-work-dir PATH` | Select the node's work directory (default `/var/ton-work`). |
+| `-e`, `--env-file PATH` | Load installation environment variables from a shell environment file. |
+| `-a`, `--author AUTHOR` | Select the MyTonCtrl GitHub owner. |
+| `-r`, `--repo REPO` | Select the MyTonCtrl repository. |
+| `-b`, `--branch BRANCH` | Select the MyTonCtrl branch. |
+| `-g`, `--node-repo REPO` | Select the TON repository. |
+| `-v`, `--node-version VERSION` | Select the TON commit, branch or tag to build. |
+| `--print-env` | Print the interactive installer's chosen settings and command; use without `-m` or `-p`. |
+| `-h`, `--help` | Print installation help. |
 
 ### Installation configuration
 
 You can also configure some installation parameters using environment variables. For example:
+
 * `VALIDATOR_CONSOLE_PORT` - port for validator console (default: random port in range 2000-65000)
 * `LITESERVER_PORT` - port for liteserver (default: random port in range 2000-65000)
 * `VALIDATOR_PORT` - port for validator (default: random port in range 2000-64000)
 
 You can provide `env` file with allowed variables to installation script:
 ```shell
-sudo bash install.sh -m <mode> --env-file /path/to/env/
+sudo bash install.sh -m <mode> --env-file /path/to/installer.env
 ```
 
 ### Interactive CLI installer
 
-To install MyTonCtrl using convenient interactive CLI installer, run the installation script without providing mode to it:
+To use the interactive CLI installer, run the installation script without a
+mode (`-m`) or backup (`-p`):
 
 ```shell
 sudo bash install.sh [args]
@@ -143,7 +133,28 @@ After installation, you can run MyTonCtrl console using the command:
 mytonctrl
 ```
 
-## Telemetry
+### Console arguments
+
+Pass console arguments directly to `mytonctrl`:
+
+| Console argument | Description |
+| --- | --- |
+| `-c`, `--config PATH` | Read a different controller database (`mytoncore.db`). |
+| `-w`, `--wallets DIR` | Use a different wallets directory. |
+| `-s`, `--no-startup-checks` | Skip console startup checks. |
+| `--cmd COMMAND` | Run a console command and exit; also skips startup checks. |
+| `-h`, `--help` | Print console help. |
+
+```sh
+mytonctrl --cmd "get modes"
+```
+
+Installer `-c` selects the network configuration; console `-c` selects the
+controller database. Installer `-i` skips hardware checks; console `-s` skips
+startup checks.
+
+### Telemetry
+
 By default, MyTonCtrl sends validator statistics to the https://toncenter.com server.
 It is necessary to identify network abnormalities, as well as to quickly give feedback to developers.
 To disable telemetry during installation, use the `-t` flag:
@@ -155,3 +166,186 @@ To disable telemetry after installation, do the following:
 ```sh
 MyTonCtrl> set sendTelemetry false
 ```
+
+## Docker image
+
+MyTonCtrl and TON use separate images. The official TON image supplies binaries
+and Fift resources to a shared volume, with its `init.sh` entrypoint bypassed.
+The MyTonCtrl image initializes and runs the node using those mounted artifacts.
+It requires the artifacts to be mounted before startup. Node state, keys,
+wallets and controller settings persist in a separate work volume.
+
+The commands below use the included `compose.yaml` from the repository root.
+Use the same `.env` volume names and Compose project name throughout the setup's
+lifetime. Compose uses host networking for Linux nodes. See [Docker setup](docker/README.md)
+for standalone Docker commands, existing TON container mounts and runtime details.
+
+### Installation arguments in .env
+
+Use the same [installation options](#installation-options) as the host installer,
+provided through `MYTONCTRL_ARGS` in `.env`. Create the file on first setup:
+
+```sh
+cp .env.example .env
+```
+
+The default settings build the local controller checkout and install a mainnet
+validator using a prepared dump:
+
+```dotenv
+TON_IMAGE=ghcr.io/ton-blockchain/ton:latest
+MYTONCTRL_IMAGE=mytonctrl:local
+MYTONCTRL_ARGS=-m validator -n mainnet -d
+PUBLIC_IP=
+```
+
+Leave `PUBLIC_IP` blank to autodetect the public IPv4 address, or set the address
+the node should advertise. The entrypoint validates it before initialization.
+Choose and pin image tags or digests in `TON_IMAGE` and `MYTONCTRL_IMAGE`.
+
+Installation arguments apply when initializing an empty work volume. Existing
+installations keep their configuration; use console commands for later changes.
+Keep `-u`, `-B`, `-S` and `-W` fixed when reusing a work volume. The controller user
+defaults to `root`; `-u USER` selects the controller service account. The TON node
+runs as `validator`.
+
+For example, to install a testnet liteserver with telemetry disabled:
+
+```dotenv
+MYTONCTRL_ARGS=-m liteserver -n testnet -t
+```
+
+Docker supports these adaptations of the host arguments:
+
+| Option | Docker behavior |
+| --- | --- |
+| `-c`, `--config` | Accepts a URL or an absolute path to a mounted network configuration file. For a custom network, use `-n custom -c URL` or `-n custom -c /mounted/global.config.json`. |
+| `-e`, `--env-file` | Reads a mounted file of `KEY=value` data. Compose already loads `.env`; standalone Docker uses `--env-file .env`. |
+| `-a`/`-r`/`-b`, `--author`/`--repo`/`--branch` | Select the checkout when building the controller image, then select `MYTONCTRL_IMAGE`. These source-selection arguments are unavailable at runtime. |
+| `-g`/`-v`, `--node-repo`/`--node-version` | Select `TON_IMAGE` to choose prebuilt TON binaries. These source-selection arguments are unavailable at runtime. |
+| `--print-env`, `--help` | Print parsed installation settings or help and exit. |
+| `-s`, `--no-startup-checks` | Docker extension: add to `MYTONCTRL_ARGS` to skip console startup checks. Installation flags are kept separate from console arguments. |
+
+Mount files referenced by `-c`, `-p` or `-e` into the controller using Compose
+volumes. `--archive` also requires a mounted prebuilt `tonutils-storage` executable;
+see [Docker environment options](docker/README.md#environment-options).
+
+### Start and open the console
+
+Build the local checkout and start both services:
+
+```sh
+docker compose pull ton-binaries
+docker compose build mytonctrl
+docker compose up -d --no-build --pull never
+docker compose logs -f mytonctrl
+```
+
+The `ton-binaries` service exits after exporting artifacts. The `mytonctrl`
+service keeps the node and controller running. Allow the configured validator
+and QUIC UDP ports and liteserver TCP port through the host firewall; keep the
+validator console port private.
+
+Open the console or run a command using the same [console arguments](#console-arguments)
+as the host utility:
+
+```sh
+docker compose exec mytonctrl mytonctrl
+docker compose exec mytonctrl mytonctrl --cmd "get modes"
+```
+
+Console defaults can also be set in `.env` using `MYTONCTRL_CONFIG`,
+`MYTONCTRL_WALLETS` and `MYTONCTRL_CMD`. Use `-s` in `MYTONCTRL_ARGS` for the startup
+check default. Explicit console arguments take precedence for options with values.
+
+To start with a published controller image, set
+`MYTONCTRL_IMAGE=ghcr.io/<repository-owner>/mytonctrl:<tag>` in `.env`, then:
+
+```sh
+docker compose pull mytonctrl ton-binaries
+docker compose up -d --no-build
+```
+
+The publishing workflows use `dev` for commits to `dev`, `latest` for commits to
+`master`, and a required tag input for manual builds.
+
+### Stop and resume
+
+Stop the node and controller while keeping their containers and data:
+
+```sh
+docker compose stop mytonctrl
+```
+
+Resume the stopped container:
+
+```sh
+docker compose restart --no-deps mytonctrl
+```
+
+To remove the service containers while keeping the persistent volumes, use:
+
+```sh
+docker compose down
+```
+
+Start them again with `docker compose up -d --no-build`.
+
+### Upgrade the TON image
+
+Set `TON_IMAGE` to the desired tag or digest in `.env`, then pull the image and
+export its binaries:
+
+```sh
+docker compose pull ton-binaries
+docker compose run --rm --no-deps ton-binaries
+```
+
+The running controller keeps using its private copy of the previous TON binaries
+and resources. Adopt the newly exported TON release when ready:
+
+```sh
+docker compose restart --no-deps mytonctrl
+```
+
+Every controller start, restart or recreation selects the currently exported
+TON release. Updating `TON_IMAGE` in `.env` alone does not export new binaries.
+
+### Upgrade the MyTonCtrl image
+
+For a published image, set `MYTONCTRL_IMAGE` to the desired tag in `.env`, then
+pull it and recreate the controller:
+
+```sh
+docker compose pull mytonctrl
+docker compose up -d --no-deps --no-build mytonctrl
+```
+
+For a local build, update the checkout, keep a local `MYTONCTRL_IMAGE` tag in
+`.env`, and build and recreate the controller:
+
+```sh
+docker compose build mytonctrl
+docker compose up -d --no-deps --no-build --pull never mytonctrl
+```
+
+Both methods preserve the work volume and reuse node keys, wallets and settings.
+Recreation also adopts the currently exported TON release. Use these image
+updates for container deployments; the console's `update` and `upgrade` commands
+refer to this workflow. A container restart alone does not replace its controller
+image or reload `.env` changes.
+
+### Remove the Docker setup
+
+Remove this Compose setup's containers, named volumes and service images:
+
+```sh
+docker compose down --volumes --rmi all --remove-orphans
+```
+
+**This deletes node keys, wallets, blockchain data, controller settings and
+exported TON artifacts. Save any required backup outside these volumes first.**
+The cleanup applies to the services and volumes in this Compose file; see the
+[Compose down reference](https://docs.docker.com/reference/cli/docker/compose/down/)
+for flag details. To also remove the local configuration file after teardown,
+run `rm .env`.
