@@ -9,8 +9,12 @@ first initialization. Optional dump/archive downloads remain explicit settings.
 The [official TON image](https://github.com/ton-blockchain/ton/blob/master/Dockerfile)
 contains executables in `/usr/local/bin`, Fift libraries in `/usr/lib/fift`, and
 wallet/contract scripts in `/usr/share/ton/smartcont`. All three are required.
-`docker/export-ton.sh` runs in that unchanged image with `init.sh` bypassed. It
-publishes immutable releases to a shared volume and atomically selects `current`.
+The controller image packages `export-ton.sh`. Compose first runs `ton-exporter`
+using that same image to copy the script into a shared `ton-scripts` volume.
+`ton-binaries` mounts the script volume read-only and runs the script in the
+unchanged official image with `init.sh` bypassed. It publishes immutable releases
+to a shared artifact volume and atomically selects `current`. There are two
+images and three services; the exporter helper exits after copying the script.
 MyTonCtrl mounts that volume read-only, checks its contents and binary architecture,
 then copies one release to a private `/run/ton-active` snapshot before starting.
 It refuses startup if artifacts are missing or their runtime dependencies cannot
@@ -19,21 +23,27 @@ TON runtime, with runtime libraries and diagnostic tools only.
 
 ## Start with Compose
 
+Use the [quick setup installer](../README.md#quick-setup) in an empty deployment
+directory. It creates `.env` and `compose.yml` for published images. After
+editing `.env`, start the setup:
+
 ```sh
-cp .env.example .env
 # Edit .env: choose installation options in MYTONCTRL_ARGS.
 # PUBLIC_IP is optional: leave blank to autodetect, or set the advertised IPv4.
 # Pin TON_IMAGE and select your tagged MYTONCTRL_IMAGE.
-docker compose build mytonctrl
-docker compose up -d
+docker compose pull
+docker compose up -d --no-build --pull never
 docker compose logs -f mytonctrl
 docker compose exec mytonctrl mytonctrl
 ```
 
-For build metadata set `MYTONCTRL_BUILD_COMMIT` and `MYTONCTRL_BUILD_VERSION` in
-`.env`, or pass `--build-arg MYTONCTRL_COMMIT=... --build-arg MYTONCTRL_VERSION=...`
-to `docker build`. Every build packages the current local checkout; no controller
-code or Python environment is stored in a data volume.
+The selected controller image tag must have been published by GitHub Actions
+before it can be pulled. For a local build, use the checkout root's `compose.yaml`
+as described in [development setup](../README.md#build-from-a-local-checkout-optional).
+For build metadata, set `MYTONCTRL_BUILD_COMMIT` and `MYTONCTRL_BUILD_VERSION` in
+the checkout's `.env`, or pass `--build-arg MYTONCTRL_COMMIT=...`
+and `--build-arg MYTONCTRL_VERSION=...` to `docker build`. No controller code or
+Python environment is stored in a data volume.
 
 Compose uses host networking, intended for Linux TON nodes. Allow the selected
 validator UDP port, QUIC UDP port and liteserver TCP port through the host firewall.
@@ -50,19 +60,29 @@ controllers from opening the same node state.
 
 ## Start without Compose
 
+Prepare `.env` with the [quick setup installer](../README.md#quick-setup), then
+use Docker directly. Replace the image tags below with your selected versions.
+The exporter comes from the controller image:
+
 ```sh
-docker build -t mytonctrl:local .
+docker pull ghcr.io/neodix42/mytonctrl:latest
+docker pull ghcr.io/ton-blockchain/ton:latest
+docker volume create mytonctrl-ton-scripts
 docker volume create mytonctrl-ton-artifacts
 docker volume create mytonctrl-ton-work
 docker run --rm --entrypoint /bin/sh \
+  --mount type=volume,src=mytonctrl-ton-scripts,dst=/scripts \
+  ghcr.io/neodix42/mytonctrl:latest \
+  -c 'cp /usr/local/lib/mytonctrl/export-ton.sh /scripts/export-ton.sh'
+docker run --rm --entrypoint /bin/sh \
   --mount type=volume,src=mytonctrl-ton-artifacts,dst=/ton-artifacts \
-  --mount type=bind,src="$PWD/docker/export-ton.sh",dst=/scripts/export-ton.sh,readonly \
+  --mount type=volume,src=mytonctrl-ton-scripts,dst=/scripts,readonly \
   ghcr.io/ton-blockchain/ton:latest /scripts/export-ton.sh
 docker run -d --name mytonctrl --network host --stop-timeout 75 \
   --env-file .env \
   --mount type=volume,src=mytonctrl-ton-artifacts,dst=/ton-artifacts,readonly \
   --mount type=volume,src=mytonctrl-ton-work,dst=/var/ton-work \
-  mytonctrl:local
+  ghcr.io/neodix42/mytonctrl:latest
 docker exec -it mytonctrl mytonctrl
 ```
 
@@ -71,7 +91,7 @@ Check mounts and binary dependencies without initializing node state:
 ```sh
 docker run --rm \
   --mount type=volume,src=mytonctrl-ton-artifacts,dst=/ton-artifacts,readonly \
-  mytonctrl:local check
+  ghcr.io/neodix42/mytonctrl:latest check
 ```
 
 ## Use an existing TON container's volumes
@@ -90,7 +110,7 @@ docker run -d --name mytonctrl --network host --stop-timeout 75 --env-file .env 
   -v ton-native-fift:/ton-source/fift:ro \
   -v ton-native-smartcont:/ton-source/smartcont:ro \
   -v mytonctrl-ton-work:/var/ton-work \
-  mytonctrl:local
+  ghcr.io/neodix42/mytonctrl:latest
 ```
 
 Docker populates new empty named volumes from the official image directories.
@@ -111,7 +131,7 @@ To publish a newer TON image, change `TON_IMAGE` in `.env`, then:
 
 ```sh
 docker compose pull ton-binaries
-docker compose run --rm --no-deps ton-binaries
+docker compose run --rm ton-binaries
 ```
 
 The running controller keeps its private binaries and Fift resources. Its node
@@ -119,17 +139,22 @@ process and later console commands continue using the old release. To adopt the
 new TON binaries, explicitly restart it:
 
 ```sh
-docker compose restart mytonctrl
+docker compose restart --no-deps mytonctrl
 ```
 
-To update MyTonCtrl, build the new checkout with a new controller image tag, or
-pull a published controller image, then recreate only the controller:
+To update MyTonCtrl, select a published controller image tag in `.env`, pull it,
+and recreate only the controller:
 
 ```sh
-docker compose build mytonctrl
-docker compose up -d --no-deps mytonctrl
+docker compose pull mytonctrl
+docker compose run --rm --no-deps ton-exporter
+docker compose up -d --no-deps --no-build --pull never mytonctrl
 ```
 
+Local development builds use the checkout's `compose.yaml`; see
+[controller updates](../README.md#upgrade-the-mytonctrl-image).
+
+The helper refreshes the packaged exporter script for future TON exports.
 Persisted node and controller data are reused. Console `update` and `upgrade`
 explain this image-based workflow. No in-container TON or MyTonCtrl upgrade
 downloads, cloning or binary compilation take place. Old exported TON releases are retained; clean them up
@@ -141,7 +166,7 @@ TON or MyTonCtrl in this image.
 
 ## Published controller images
 
-GitHub Actions publishes `ghcr.io/<lowercase-repository-owner>/mytonctrl` for
+GitHub Actions builds and publishes `ghcr.io/<lowercase-repository-owner>/mytonctrl` for
 both `linux/amd64` and `linux/arm64`:
 
 | Trigger | Image tag |
@@ -157,12 +182,15 @@ choose the branch or tag to build, and supply the image tag (for example,
 `v1.0.0`). These workflows build the selected checkout and publish using the
 repository's `GITHUB_TOKEN`.
 
+Image tags become available after the publishing workflow completes successfully.
+
 Set `MYTONCTRL_IMAGE=ghcr.io/<lowercase-repository-owner>/mytonctrl:<tag>` in
 `.env` to use a published image. Pull and recreate only the controller:
 
 ```sh
 docker compose pull mytonctrl
-docker compose up -d --no-deps --no-build mytonctrl
+docker compose run --rm --no-deps ton-exporter
+docker compose up -d --no-deps --no-build --pull never mytonctrl
 ```
 
 ## Environment options
@@ -262,16 +290,19 @@ An older image could pass `--ip :30303` to the validator when `PUBLIC_IP` was
 empty, leaving a failed installation. Current images autodetect and validate
 blank or missing `PUBLIC_IP` before installation begins.
 
-For a failed first installation, correct `.env` and rebuild the image, then reset
-the volumes and retry. **This deletes the node's keys and all stored data:**
+For a failed first installation, correct `.env` and select the fixed controller
+image, then reset the volumes and retry. **This deletes the node's keys and all
+stored data:**
 
 ```sh
 docker compose down -v
-docker compose up -d --build
+docker compose pull
+docker compose up -d --no-build --pull never
 ```
 
 For a node with existing keys or data to retain, restore a valid backup instead
-of resetting its volumes.
+of resetting its volumes. For local development, rebuild the controller from the
+checkout using `compose.yaml` before retrying.
 
 ## Development checks
 

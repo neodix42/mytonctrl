@@ -38,6 +38,7 @@ COPY --from=package /wheels /wheels
 RUN /opt/mytonctrl/venv/bin/pip install --only-binary=:all: /wheels/*.whl \
     && rm -rf /wheels
 COPY docker/entrypoint.py docker/console.py docker/run-service.py docker/mytonctrl_docker_args.py /usr/local/lib/mytonctrl/
+COPY docker/export-ton.sh /usr/local/lib/mytonctrl/export-ton.sh
 COPY docker/systemctl.py /usr/local/bin/systemctl
 COPY docker/supervisord.conf /etc/supervisor/mytonctrl.conf
 RUN chmod 755 /usr/local/bin/systemctl \

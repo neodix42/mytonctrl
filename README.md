@@ -41,36 +41,37 @@ Learn more about node types: https://docs.ton.org/v3/documentation/nodes/overvie
 
 ### Install
 
+Host installation uses `scripts/install.sh`, downloaded below as `install-host.sh`.
 Installation and upgrades use `sudo` or `su` to install system components. You
 may be prompted for the root or sudo user's password.
 
 1. Download installation script:
 	```shell
-	wget https://raw.githubusercontent.com/ton-blockchain/mytonctrl/master/scripts/install.sh
+	wget -O install-host.sh https://raw.githubusercontent.com/ton-blockchain/mytonctrl/master/scripts/install.sh
 	```
 
 2. Run script with desired options:
 	```shell
-	sudo bash install.sh -m <mode>
+	sudo bash install-host.sh -m <mode>
 	```
 	Or for Debian:
 	```shell
-	su root -c 'bash install.sh -m <mode>'
+	su root -c 'bash install-host.sh -m <mode>'
 	```
 
 To install a full archive liteserver, use:
 ```shell
-sudo bash install.sh -m liteserver --archive
+sudo bash install-host.sh -m liteserver --archive
 ```
 
-To view all available installation options use `bash install.sh --help`
+To view all available installation options use `bash install-host.sh --help`
 
 ### Installation options
 
-Pass these options directly to `sudo bash install.sh`. For example:
+Pass these options directly to `sudo bash install-host.sh`. For example:
 
 ```sh
-sudo bash install.sh -m validator -n mainnet -d
+sudo bash install-host.sh -m validator -n mainnet -d
 ```
 
 | Installation option | Description |
@@ -108,7 +109,7 @@ You can also configure some installation parameters using environment variables.
 
 You can provide `env` file with allowed variables to installation script:
 ```shell
-sudo bash install.sh -m <mode> --env-file /path/to/installer.env
+sudo bash install-host.sh -m <mode> --env-file /path/to/installer.env
 ```
 
 ### Interactive CLI installer
@@ -117,7 +118,7 @@ To use the interactive CLI installer, run the installation script without a
 mode (`-m`) or backup (`-p`):
 
 ```shell
-sudo bash install.sh [args]
+sudo bash install-host.sh [args]
 ```
 You will be prompted to choose the installation mode and other options.
 
@@ -125,7 +126,7 @@ To run the interactive installer in `dry-run` mode, which will show you all the 
 that will be executed during installation without actually installing MyTonCtrl, use flag `--print-env`:
 
 ```shell
-sudo bash install.sh --print-env
+sudo bash install-host.sh --print-env
 ```
 
 After installation, you can run MyTonCtrl console using the command:
@@ -159,7 +160,7 @@ By default, MyTonCtrl sends validator statistics to the https://toncenter.com se
 It is necessary to identify network abnormalities, as well as to quickly give feedback to developers.
 To disable telemetry during installation, use the `-t` flag:
 ```sh
-sudo bash install.sh -m <mode> -t
+sudo bash install-host.sh -m <mode> -t
 ```
 
 To disable telemetry after installation, do the following:
@@ -175,26 +176,55 @@ The MyTonCtrl image initializes and runs the node using those mounted artifacts.
 It requires the artifacts to be mounted before startup. Node state, keys,
 wallets and controller settings persist in a separate work volume.
 
-The commands below use the included `compose.yaml` from the repository root.
-Use the same `.env` volume names and Compose project name throughout the setup's
-lifetime. Compose uses host networking for Linux nodes. See [Docker setup](docker/README.md)
-for standalone Docker commands, existing TON container mounts and runtime details.
+### Quick setup
+
+With Docker and Compose installed on Linux, prepare an empty deployment directory:
+
+```sh
+mkdir mytonctrl-docker
+cd mytonctrl-docker
+wget -O install.sh https://raw.githubusercontent.com/neodiX42/mytonctrl/master/install.sh
+bash install.sh
+```
+
+Alternatively, run the installer directly from an empty deployment directory:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/neodiX42/mytonctrl/master/install.sh | bash
+```
+
+The installer downloads only `.env` and `compose.yml` into the current
+directory. It refuses existing environment or Compose files.
+It prepares the setup without installing Docker or starting containers. Edit
+`.env`, then [start the containers and open the console](#start-and-open-the-console).
+
+The default `--branch master` selects master assets and
+`ghcr.io/neodix42/mytonctrl:latest`. For dev assets and the `dev` image, use:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/neodiX42/mytonctrl/dev/install.sh | bash -s -- --branch dev
+```
+
+Use `--image IMAGE` to select another published controller image and `--help`
+to view setup options. The download commands require these installer files on
+the selected branch; startup requires its image tag to have been published by
+GitHub Actions.
+
+The commands below use the downloaded `compose.yml`. Keep the same `.env`
+volume names and Compose project name throughout the setup's lifetime. Compose
+uses host networking for Linux nodes. See [Docker setup](docker/README.md) for
+standalone Docker commands, existing TON mounts and runtime details.
 
 ### Installation arguments in .env
 
 Use the same [installation options](#installation-options) as the host installer,
-provided through `MYTONCTRL_ARGS` in `.env`. Create the file on first setup:
-
-```sh
-cp .env.example .env
-```
-
-The default settings build the local controller checkout and install a mainnet
+provided through `MYTONCTRL_ARGS` in the `.env` created by quick setup.
+The default settings use a published controller image and install a mainnet
 validator using a prepared dump:
 
 ```dotenv
 TON_IMAGE=ghcr.io/ton-blockchain/ton:latest
-MYTONCTRL_IMAGE=mytonctrl:local
+MYTONCTRL_IMAGE=ghcr.io/neodix42/mytonctrl:latest
 MYTONCTRL_ARGS=-m validator -n mainnet -d
 PUBLIC_IP=
 ```
@@ -232,19 +262,22 @@ see [Docker environment options](docker/README.md#environment-options).
 
 ### Start and open the console
 
-Build the local checkout and start both services:
+After editing `.env`, pull the selected images and start the setup from
+the deployment directory:
 
 ```sh
-docker compose pull ton-binaries
-docker compose build mytonctrl
+docker compose pull
 docker compose up -d --no-build --pull never
 docker compose logs -f mytonctrl
 ```
 
-The `ton-binaries` service exits after exporting artifacts. The `mytonctrl`
-service keeps the node and controller running. Allow the configured validator
-and QUIC UDP ports and liteserver TCP port through the host firewall; keep the
-validator console port private.
+The one-shot `ton-exporter` service uses the same controller image to copy its
+packaged exporter script into a shared script volume. `ton-binaries` then runs
+that script in the official TON image and exits after exporting artifacts.
+These three services use two images. The `mytonctrl` service keeps the node and
+controller running. Allow the configured validator and QUIC UDP ports and
+liteserver TCP port through the host firewall; keep the validator console port
+private.
 
 Open the console or run a command using the same [console arguments](#console-arguments)
 as the host utility:
@@ -258,16 +291,27 @@ Console defaults can also be set in `.env` using `MYTONCTRL_CONFIG`,
 `MYTONCTRL_WALLETS` and `MYTONCTRL_CMD`. Use `-s` in `MYTONCTRL_ARGS` for the startup
 check default. Explicit console arguments take precedence for options with values.
 
-To start with a published controller image, set
-`MYTONCTRL_IMAGE=ghcr.io/<repository-owner>/mytonctrl:<tag>` in `.env`, then:
-
-```sh
-docker compose pull mytonctrl ton-binaries
-docker compose up -d --no-build
-```
-
 The publishing workflows use `dev` for commits to `dev`, `latest` for commits to
 `master`, and a required tag input for manual builds.
+
+### Build from a local checkout (optional)
+
+For development, use the repository root's `compose.yaml`, which supports
+building the local checkout. The quick setup's `compose.yml` uses published
+images only. On the first setup in a checkout, create its `.env`:
+
+```sh
+cp .env.example .env
+```
+
+Keep `MYTONCTRL_IMAGE=mytonctrl:local` or choose another local image tag, then
+run these commands from that checkout's root:
+
+```sh
+docker compose -f compose.yaml pull ton-binaries
+docker compose -f compose.yaml build mytonctrl
+docker compose -f compose.yaml up -d --no-build --pull never
+```
 
 ### Stop and resume
 
@@ -289,7 +333,7 @@ To remove the service containers while keeping the persistent volumes, use:
 docker compose down
 ```
 
-Start them again with `docker compose up -d --no-build`.
+Start them again with `docker compose up -d --no-build --pull never`.
 
 ### Upgrade the TON image
 
@@ -298,7 +342,7 @@ export its binaries:
 
 ```sh
 docker compose pull ton-binaries
-docker compose run --rm --no-deps ton-binaries
+docker compose run --rm ton-binaries
 ```
 
 The running controller keeps using its private copy of the previous TON binaries
@@ -318,18 +362,22 @@ pull it and recreate the controller:
 
 ```sh
 docker compose pull mytonctrl
-docker compose up -d --no-deps --no-build mytonctrl
-```
-
-For a local build, update the checkout, keep a local `MYTONCTRL_IMAGE` tag in
-`.env`, and build and recreate the controller:
-
-```sh
-docker compose build mytonctrl
+docker compose run --rm --no-deps ton-exporter
 docker compose up -d --no-deps --no-build --pull never mytonctrl
 ```
 
-Both methods preserve the work volume and reuse node keys, wallets and settings.
+For a [local development setup](#build-from-a-local-checkout-optional), update
+the checkout and keep its local `MYTONCTRL_IMAGE` tag in `.env`. From that same
+checkout's root, build and recreate using its `compose.yaml`:
+
+```sh
+docker compose -f compose.yaml build mytonctrl
+docker compose -f compose.yaml run --rm --no-deps ton-exporter
+docker compose -f compose.yaml up -d --no-deps --no-build --pull never mytonctrl
+```
+
+Both methods refresh the packaged exporter script, preserve the work volume and
+reuse node keys, wallets and settings.
 Recreation also adopts the currently exported TON release. Use these image
 updates for container deployments; the console's `update` and `upgrade` commands
 refer to this workflow. A container restart alone does not replace its controller
@@ -347,5 +395,9 @@ docker compose down --volumes --rmi all --remove-orphans
 exported TON artifacts. Save any required backup outside these volumes first.**
 The cleanup applies to the services and volumes in this Compose file; see the
 [Compose down reference](https://docs.docker.com/reference/cli/docker/compose/down/)
-for flag details. To also remove the local configuration file after teardown,
-run `rm .env`.
+for flag details. To also remove the files downloaded by quick setup after
+teardown, run:
+
+```sh
+rm -f .env compose.yml install.sh
+```
