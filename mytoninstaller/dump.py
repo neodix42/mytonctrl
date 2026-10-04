@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ import requests
 from mypylib import MyPyClass
 from mytoninstaller.context import InstallerContext
 from mytoninstaller.utils import is_testnet
+from mytonctrl.utils import is_container
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,11 @@ class DumpMetadata:
 
 def download_dump(local: MyPyClass, ctx: InstallerContext) -> bool:
     local.add_log("start download_dump function", "debug")
+    if is_container():
+        missing = [tool for tool in ("plzip", "aria2c", "tar", "sha256sum") if shutil.which(tool) is None]
+        if missing:
+            local.add_log(f"Missing dump tools in the controller image: {', '.join(missing)}", "error")
+            return False
     base_url = "https://dump.ton.org/dumps"
     dump_name = "latest"
     if is_testnet(ctx.paths.global_config_path):
@@ -51,11 +58,11 @@ def download_dump(local: MyPyClass, ctx: InstallerContext) -> bool:
     if not check_dump_space(local, dump_dir, dump_cache_dir, dump_metadata):
         return False
 
-    # apt install
-    apt_result = subprocess.run(["apt", "install", "plzip", "aria2", "curl", "-y"]).returncode
-    if apt_result != 0:
-        local.add_log(f"Failed to install dump tools with exit code {apt_result}", "error")
-        return False
+    if not is_container():
+        apt_result = subprocess.run(["apt", "install", "plzip", "aria2", "curl", "-y"]).returncode
+        if apt_result != 0:
+            local.add_log(f"Failed to install dump tools with exit code {apt_result}", "error")
+            return False
 
     # download dump using aria2c to a temporary file
     cmd = [

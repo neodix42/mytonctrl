@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import os.path
+import pwd
+import shlex
 import shutil
 import sys
 import time
@@ -19,7 +21,7 @@ from mypylib.mypylib import (
 	Dict, int2ip
 )
 from mytoncore.models import Paths
-from mytonctrl.utils import is_hex
+from mytonctrl.utils import is_hex, is_container
 from mytoninstaller.archive_blocks import run_process_hardforks, parse_block_value, download_bag, update_init_block, \
 	download_blocks_bag, download_master_blocks_bag
 from mytoninstaller.context import InstallerContext, InstallerPaths
@@ -31,6 +33,31 @@ from mytoninstaller.dump import download_dump
 
 def _get_dir_from_path(path: str) -> str:
 	return path[:path.rfind('/') + 1]
+
+
+def _run_as_installer_user(user: str, args: list[str]):
+	if not is_container():
+		return subprocess.run(["su", "-l", user, "-c", ' '.join(args)])
+	if user == "root":
+		return subprocess.run(args, check=True)
+	env = os.environ.copy()
+	home = pwd.getpwnam(user).pw_dir
+	env.update(HOME=home, USER=user, LOGNAME=user, XDG_DATA_HOME=os.path.join(home, ".local", "share"))
+	return subprocess.run(["su", "-p", "-s", "/bin/sh", user, "-c", shlex.join(args)], env=env, check=True)
+
+
+def _container_validator_threads() -> int:
+	try:
+		cpus = len(os.sched_getaffinity(0))
+	except (AttributeError, OSError):
+		cpus = psutil.cpu_count() or 1
+	try:
+		quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+		if quota != "max":
+			cpus = min(cpus, max(1, int(quota) // int(period)))
+	except (OSError, ValueError, ZeroDivisionError):
+		pass
+	return max(1, cpus - 1)
 
 
 def FirstNodeSettings(local: MyPyClass, ctx: InstallerContext):
@@ -80,10 +107,13 @@ def FirstNodeSettings(local: MyPyClass, ctx: InstallerContext):
 	os.makedirs(keys_dir, exist_ok=True)
 
 	# Прописать автозагрузку
-	cpus = psutil.cpu_count()
-	if cpus is None:
-		raise ValueError("Failed to get CPU count")
-	cpus -= 1
+	if is_container():
+		cpus = _container_validator_threads()
+	else:
+		cpus = psutil.cpu_count()
+		if cpus is None:
+			raise ValueError("Failed to get CPU count")
+		cpus -= 1
 
 	ttl_cmd = ''
 	if archive_ttl == -1:
@@ -115,7 +145,7 @@ def FirstNodeSettings(local: MyPyClass, ctx: InstallerContext):
 	# Первый запуск
 	local.add_log("First start validator - create config.json", "debug")
 	args = [validatorAppPath, "--global-config", globalConfigPath, "--db", ton_db_dir, "--ip", addr, "--logname", tonLogPath]
-	subprocess.run(args)
+	subprocess.run(args, check=True)
 
 	if ctx.dump:
 		if download_dump(local, ctx) is False:
@@ -126,8 +156,14 @@ def FirstNodeSettings(local: MyPyClass, ctx: InstallerContext):
 
 	# chown 1
 	local.add_log("Chown ton-work dir", "debug")
-	args = ["chown", "-R", vuser + ':' + vuser, ton_work_dir]
-	subprocess.run(args)
+	if is_container():
+		# The same volume also contains controller data owned by ctx.user.
+		subprocess.run(["chown", vuser + ':' + vuser, ton_work_dir], check=True)
+		logs = [str(path) for path in Path(tonLogPath).parent.glob(Path(tonLogPath).name + "*") if path.is_file()]
+		subprocess.run(["chown", "-R", vuser + ':' + vuser, ton_db_dir, keys_dir, *logs], check=True)
+	else:
+		args = ["chown", "-R", vuser + ':' + vuser, ton_work_dir]
+		subprocess.run(args)
 
 	# start validator
 	StartValidator(local)
@@ -429,9 +465,7 @@ def EnableValidatorConsole(local: MyPyClass, ctx: InstallerContext):
 	if ctx.ports.quic is not None:
 		event_name += f'_{ctx.ports.quic}'
 
-	cmd = f'{sys.executable} -m mytoncore -e "{event_name}"'
-	args = ["su", "-l", user, "-c", cmd]
-	subprocess.run(args)
+	_run_as_installer_user(user, [sys.executable, "-m", "mytoncore", "-e", event_name])
 
 	# restart mytoncore
 	StartMytoncore(local)
@@ -562,8 +596,7 @@ def EnableMode(local: MyPyClass, ctx: InstallerContext):
 		args.append("enable_mode_" + ctx.mode)
 	else:
 		return
-	args = ["su", "-l", ctx.user, "-c", ' '.join(args)]
-	subprocess.run(args)
+	_run_as_installer_user(ctx.user, args)
 
 
 def set_external_ip(local: MyPyClass, ip: str, mconfig_path: str):
@@ -589,10 +622,13 @@ def ConfigureFromBackup(local: MyPyClass, ctx: InstallerContext):
 	os.makedirs(ctx.paths.ton_work_dir, exist_ok=True)
 	ton_work_dir = ctx.paths.ton_work_dir.rstrip('/')
 	if not ctx.only_mtc:
-		ip = str(ip2int(get_own_ip()))
-		BackupModule.run_restore_backup(["-m", mconfig_dir, "-n", backup_file, "-i", ip, "-t", ton_work_dir], user=ctx.user)
+		public_ip = ctx.public_ip if is_container() and ctx.public_ip else get_own_ip()
+		ip = str(ip2int(public_ip))
+		exit_code = BackupModule.run_restore_backup(["-m", mconfig_dir, "-n", backup_file, "-i", ip, "-t", ton_work_dir], user=ctx.user)
 	else:
-		BackupModule.run_restore_backup(["-m", mconfig_dir, "-n", backup_file, "-t", ton_work_dir], user=ctx.user)
+		exit_code = BackupModule.run_restore_backup(["-m", mconfig_dir, "-n", backup_file, "-t", ton_work_dir], user=ctx.user)
+	if is_container() and exit_code != 0:
+		raise RuntimeError(f"Backup restoration failed with exit code {exit_code}; persistent state was retained for inspection")
 
 	# the restored mconfig may carry the donor's paths. re-write the target ones
 	write_paths(local, ctx)
@@ -651,8 +687,7 @@ def SetupCollator(local: MyPyClass, ctx: InstallerContext):
 		return
 	local.add_log("Setting up collator", "info")
 	args = [sys.executable, "-m", "mytoncore", "-e", "setup_collator"]
-	args = ["su", "-l", ctx.user, "-c", ' '.join(args)]
-	subprocess.run(args)
+	_run_as_installer_user(ctx.user, args)
 
 
 def get_paths_dict(paths: InstallerPaths) -> dict[str, str]:

@@ -47,6 +47,7 @@ from mytonctrl.utils import (
     ts_diff_to_human,
     get_service_status,
     get_service_uptime,
+    is_container,
 )
 from mytoncore.models import Config15, Config17
 from modules.module import MtcModule
@@ -512,9 +513,15 @@ class GeneralModule(MtcModule):
         paths = self.ton.get_paths()
         mtc_git_path = paths.mtc_src
         try:
-            fix_git_config(mtc_git_path)
-            mtc_git_hash = get_git_hash(mtc_git_path, short=True)
-            mtc_git_branch = get_git_branch(mtc_git_path)
+            if is_container():
+                from mytonctrl import __commit__, __version__
+
+                mtc_git_hash = __commit__
+                mtc_git_branch = __version__
+            else:
+                fix_git_config(mtc_git_path)
+                mtc_git_hash = get_git_hash(mtc_git_path, short=True)
+                mtc_git_branch = get_git_branch(mtc_git_path)
             mtc_git_hash_text = bcolors.yellow_text(mtc_git_hash)
             mtc_git_branch_text = bcolors.yellow_text(mtc_git_branch)
             mtc_version_text = self.local.translate("local_status_version_mtc").format(
@@ -526,9 +533,12 @@ class GeneralModule(MtcModule):
 
         validator_git_path = paths.ton_src
         try:
-            fix_git_config(validator_git_path)
             validator_bin_git_path = paths.ton_bin / "validator-engine" / "validator-engine"
-            validator_git_branch = get_git_branch(validator_git_path)
+            if is_container():
+                validator_git_branch = "external image"
+            else:
+                fix_git_config(validator_git_path)
+                validator_git_branch = get_git_branch(validator_git_path)
             validator_git_hash = get_bin_git_hash(validator_bin_git_path, short=True)
             validator_git_hash_text = bcolors.yellow_text(validator_git_hash)
             validator_git_branch_text = bcolors.yellow_text(validator_git_branch)
@@ -827,6 +837,9 @@ class GeneralModule(MtcModule):
             )
 
     def Update(self, args: list[str]):
+        if is_container():
+            color_print("Replace the MyTonCtrl image with a newer tagged image to update the controller.")
+            return
         repo = "mytonctrl"
         paths = self.ton.get_paths()
         author, repo, branch, _ = check_git(
@@ -859,6 +872,9 @@ class GeneralModule(MtcModule):
         self.local.exit()
 
     def Upgrade(self, args: list[str]):
+        if is_container():
+            color_print("Update the separate TON image and publish its binaries to the mounted volume. TON is not built inside the MyTonCtrl container.")
+            return
         paths = self.ton.get_paths()
 
         author, repo, branch, git_url = check_git(

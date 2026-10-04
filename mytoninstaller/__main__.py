@@ -97,7 +97,7 @@ def get_context(args) -> InstallerContext:
     archive_ttl = int(archive_ttl_env) if archive_ttl_env else None
     state_ttl_env = os.getenv('STATE_TTL')
     state_ttl = int(state_ttl_env) if state_ttl_env else None
-    public_ip = os.getenv('PUBLIC_IP')
+    public_ip = (os.getenv('PUBLIC_IP') or '').strip() or None
     add_shard = os.getenv('ADD_SHARD')
     archive_blocks = os.getenv('ARCHIVE_BLOCKS')
 

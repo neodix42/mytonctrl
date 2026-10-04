@@ -6,7 +6,7 @@ from mypylib.mypylib import MyPyClass, color_print, int2ip
 from mytoncore.mytoncore import MyTonCore
 from mytoncore.telemetry import is_host_virtual
 from mytonctrl.git import check_git_update
-from mytonctrl.utils import get_os_version, get_ton_http_api_version
+from mytonctrl.utils import get_os_version, get_ton_http_api_version, is_container
 
 
 class WarningChecker:
@@ -184,6 +184,8 @@ class WarningChecker:
             self.print_warning("nominator_pool_deprecated_warning")
 
     def check_mytonctrl_update(self):
+        if is_container():
+            return
         if self.ton.local.db.get("updateCheckDisabled"):
             return
         git_path = self.ton.get_paths().mtc_src

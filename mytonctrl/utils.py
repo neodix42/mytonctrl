@@ -13,6 +13,13 @@ import psutil
 from mypylib.mypylib import bcolors, parse
 
 
+def is_container() -> bool:
+    """Identify the controller image even when a login shell drops its environment."""
+    return os.getenv("MYTONCTRL_CONTAINER") == "1" or os.path.isfile(
+        "/etc/mytonctrl-container"
+    )
+
+
 def timestamp2utcdatetime(timestamp, format="%d.%m.%Y %H:%M:%S"):
     if timestamp is None:
         return "n/a"
