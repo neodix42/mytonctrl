@@ -197,13 +197,14 @@ class WarningChecker:
 
     def run_warnings(self):
         self.local.try_function(self.check_disk_usage)
-        self.local.try_function(self.check_sync)
-        self.local.try_function(self.check_adnl)
-        self.local.try_function(self.check_validator_balance)
+        if self.ton.local.db.get("validatorConsole") is not None:
+            self.local.try_function(self.check_sync)
+            self.local.try_function(self.check_adnl)
+            self.local.try_function(self.check_validator_balance)
+            self.local.try_function(self.check_slashed)
+            self.local.try_function(self.check_node_port)
         self.local.try_function(self.check_vps)
         self.local.try_function(self.check_tg_channel)
-        self.local.try_function(self.check_slashed)
         self.local.try_function(self.check_ubuntu_version)
-        self.local.try_function(self.check_node_port)
         self.local.try_function(self.check_ton_http_api_version)
         self.local.try_function(self.check_nominator_pool_deprecated)

@@ -248,9 +248,10 @@ are `root`, `/usr/bin`, `/usr/src` and `/var/ton-work`, respectively. Compose
 aliases a custom `-W` path to its mounted `/var/ton-work` volume, preserving
 persistent storage. Standalone Docker can mount persistent data directly at the
 selected `-W` path instead.
-When initialization fails, data are preserved and a pending marker prevents
-reuse of partial configuration. See [Troubleshooting](#troubleshooting) before
-retrying or restoring a backup.
+Interrupted initialization resumes automatically using persisted settings and
+checkpoints. Cached dumps, node keys and existing configuration are preserved;
+background tasks start after the controller's client settings are ready. See
+[recovery instructions](../README.md#recover-interrupted-initialization).
 
 All original console arguments work with `docker exec ... mytonctrl`. They can
 also be supplied through `.env`:
@@ -281,28 +282,28 @@ on a host; in container deployments run those tools in separate images instead.
 
 ## Troubleshooting
 
-Inspect the first installation error with `docker compose logs mytonctrl`.
-"Previous initialization was interrupted" means an earlier installation left
-partial configuration; the pending marker guards that data. Removing the marker
-does not complete or repair the installation.
+Inspect installation progress with `docker compose logs mytonctrl` and
+`docker compose exec mytonctrl mytonctrl --cmd status`. The console shows
+initialization and dump stages, service state and local resources even before
+ValidatorConsole is configured. Full tracebacks remain in the persistent
+`/var/ton-work/controller/mytoncore/mytoncore.log`; stdout shows error summaries.
+
+"Previous initialization was interrupted" is an error from older images.
+Select an image with the recovery fixes and use the normal
+[controller upgrade commands](../README.md#upgrade-the-mytonctrl-image) with the
+same work volume. The empty pending marker from those images is supported and
+initialization resumes without deleting the archive or node identity. Keep the
+marker and data volumes. A completed cached archive is verified and reused;
+an interrupted download continues the same archive, and an interrupted
+extraction restarts locally. Cache metadata pins the dump across image changes.
 
 An older image could pass `--ip :30303` to the validator when `PUBLIC_IP` was
 empty, leaving a failed installation. Current images autodetect and validate
 blank or missing `PUBLIC_IP` before installation begins.
 
-For a failed first installation, correct `.env` and select the fixed controller
-image, then reset the volumes and retry. **This deletes the node's keys and all
-stored data:**
-
-```sh
-docker compose down -v
-docker compose pull
-docker compose up -d --no-build --pull never
-```
-
-For a node with existing keys or data to retain, restore a valid backup instead
-of resetting its volumes. For local development, rebuild the controller from the
-checkout using `compose.yaml` before retrying.
+For local development, rebuild the controller from the checkout using
+`compose.yaml` before retrying. Invalid or ambiguous node keys/configuration
+still require inspection or a valid backup; recovery does not replace them.
 
 ## Development checks
 

@@ -377,11 +377,45 @@ docker compose -f compose.yaml up -d --no-deps --no-build --pull never mytonctrl
 ```
 
 Both methods refresh the packaged exporter script, preserve the work volume and
-reuse node keys, wallets and settings.
+reuse node keys, wallets, settings and an unfinished dump download. An upgrade
+during initialization resumes the original installation using its saved settings;
+it does not select a newer dump or discard the existing archive.
 Recreation also adopts the currently exported TON release. Use these image
 updates for container deployments; the console's `update` and `upgrade` commands
 refer to this workflow. A container restart alone does not replace its controller
 image or reload `.env` changes.
+
+### Recover interrupted initialization
+
+Use a controller image containing the recovery fixes, then follow the image
+upgrade commands above with the same `TON_WORK_VOLUME` and installation paths.
+The container resumes initialization automatically, including installations
+left by an older image with an empty `.initializing` marker. Keep the existing
+volumes and marker; `docker compose down -v` deletes the downloaded dump and
+node data.
+
+The default `DUMP_CACHE_DIR=/var/ton-work/dump-cache` is inside the persistent
+work volume. Mount persistent storage there if you choose a cache outside the
+work volume. Partial downloads resume the same pinned archive. Complete
+archives are verified and reused locally; older caches without metadata look
+up the existing archive's dated metadata rather than downloading today's dump.
+If that metadata is unavailable, startup reports the problem and preserves the
+archive. An interrupted extraction restarts from the cached archive while
+preserving node keys and configuration. The archive is removed only after the
+whole installation completes, reclaiming its disk space.
+
+Follow progress with `docker compose logs -f mytonctrl`. In another terminal,
+inspect initialization, dump, service and local resource status:
+
+```sh
+docker compose exec mytonctrl mytonctrl --cmd status
+```
+
+Opening `docker compose exec mytonctrl mytonctrl` also shows overall status.
+Unavailable node/chain fields display `n/a` while initialization is in progress;
+the controller's background tasks start after its client settings are ready.
+Error summaries appear on stdout, while full tracebacks remain in the persistent
+controller log at `/var/ton-work/controller/mytoncore/mytoncore.log`.
 
 ### Remove the Docker setup
 

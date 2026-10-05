@@ -1,6 +1,9 @@
 import json
+import os
 import re
 import subprocess
+import tempfile
+from pathlib import Path
 import requests
 
 from mypylib import MyPyClass
@@ -19,8 +22,23 @@ def GetConfig(path: str):
 
 def SetConfig(path: str, data: Dict):
 	text = json.dumps(data, indent=4)
-	with open(path, 'wt') as f:
-		f.write(text)
+	target = Path(path).resolve()
+	previous = target.stat() if target.exists() else None
+	temporary = None
+	try:
+		with tempfile.NamedTemporaryFile('wt', dir=target.parent, prefix=f'.{target.name}.', delete=False) as f:
+			temporary = f.name
+			f.write(text)
+			f.flush()
+			if previous is not None:
+				if os.geteuid() == 0:
+					os.fchown(f.fileno(), previous.st_uid, previous.st_gid)
+				os.fchmod(f.fileno(), previous.st_mode & 0o777)
+			os.fsync(f.fileno())
+		os.replace(temporary, target)
+	finally:
+		if temporary is not None and os.path.exists(temporary):
+			os.unlink(temporary)
 
 def backup_config(local: MyPyClass, config_path: str):
 	backup_path = f"{config_path}.backup"

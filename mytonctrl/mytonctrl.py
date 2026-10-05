@@ -105,8 +105,9 @@ class MyTonCtrl:
     def _pre_up(self):
         try:
             self.local.try_function(self._warning_checker.check_mytonctrl_update)
-            self.local.try_function(self._warning_checker.check_installer_user)
-            self.local.try_function(self._warning_checker.check_vport)
+            if self.ton.local.db.get("validatorConsole") is not None:
+                self.local.try_function(self._warning_checker.check_installer_user)
+                self.local.try_function(self._warning_checker.check_vport)
             self._warning_checker.run_warnings()
         except Exception as e:
             self.local.add_log(f"PreUp error: {e}", "error")
@@ -125,6 +126,14 @@ class MyTonCtrl:
 
         self.local.db.config.isLocaldbSaving = False
         self.local.run()
+
+        if cmd is None:
+            from modules.general import GeneralModule
+
+            try:
+                GeneralModule(self.ton, self.local).print_status(["fast"])
+            except Exception as error:
+                self.local.add_log(f"Status summary unavailable: {error}", "warning")
 
         if not skip_startup_checks:
             self._pre_up()
