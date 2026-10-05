@@ -105,7 +105,7 @@ class MyTonCtrl:
     def _pre_up(self):
         try:
             self.local.try_function(self._warning_checker.check_mytonctrl_update)
-            if self.ton.local.db.get("validatorConsole") is not None:
+            if self._warning_checker.validator_checks_ready():
                 self.local.try_function(self._warning_checker.check_installer_user)
                 self.local.try_function(self._warning_checker.check_vport)
             self._warning_checker.run_warnings()

@@ -6,7 +6,12 @@ from mypylib.mypylib import MyPyClass, color_print, int2ip
 from mytoncore.mytoncore import MyTonCore
 from mytoncore.telemetry import is_host_virtual
 from mytonctrl.git import check_git_update
-from mytonctrl.utils import get_os_version, get_ton_http_api_version, is_container
+from mytonctrl.utils import (
+    container_initialization_complete,
+    get_os_version,
+    get_ton_http_api_version,
+    is_container,
+)
 
 
 class WarningChecker:
@@ -15,6 +20,11 @@ class WarningChecker:
     def __init__(self, local: MyPyClass, ton: MyTonCore):
         self.local = local
         self.ton = ton
+
+    def validator_checks_ready(self):
+        return self.ton.local.db.get(
+            "validatorConsole"
+        ) is not None and container_initialization_complete(self.ton)
 
     def print_warning(self, warning_name: str):
         color_print(
@@ -197,7 +207,7 @@ class WarningChecker:
 
     def run_warnings(self):
         self.local.try_function(self.check_disk_usage)
-        if self.ton.local.db.get("validatorConsole") is not None:
+        if self.validator_checks_ready():
             self.local.try_function(self.check_sync)
             self.local.try_function(self.check_adnl)
             self.local.try_function(self.check_validator_balance)

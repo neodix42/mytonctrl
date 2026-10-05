@@ -5,6 +5,7 @@ import pytest
 from mypylib.mypylib import Dict
 from modules import general
 from mytonctrl.warnings import WarningChecker
+from mytonctrl import utils
 from tests.conftest import TestLocal, TestMyPyConsole
 
 
@@ -26,7 +27,9 @@ def initializing_node(ton, tmp_path, monkeypatch):
     with open(ton.local.db_path, "w") as config:
         json.dump(ton.local.db, config)
     monkeypatch.setattr(general, "is_container", lambda: True)
+    monkeypatch.setattr(utils, "is_container", lambda: True)
     monkeypatch.setattr(general, "get_service_status", lambda name: False)
+    monkeypatch.setattr(general, "get_service_state", lambda name: "STOPPED")
     monkeypatch.setattr(general, "get_service_uptime", lambda name: None)
     monkeypatch.setattr(general, "get_bin_git_hash", lambda *args, **kwargs: "ton-build")
     return work
@@ -171,3 +174,66 @@ def test_incomplete_console_skips_unavailable_validator_warnings(cli, ton, initi
     assert "user check ran" not in output
     assert "port check ran" not in output
     assert "ValidatorConsole is not initialized" not in output
+
+
+@pytest.mark.parametrize("progress", ["running", "failed"])
+def test_configured_console_does_not_query_validator_before_initialization_finishes(
+    cli, ton, initializing_node, monkeypatch, progress,
+):
+    (initializing_node / "controller/installer-progress.json").write_text(json.dumps({
+        "version": 1, "stage": "validator_console", "status": progress,
+    }))
+    with open(ton.local.db_path) as file:
+        config = json.load(file)
+    config["validatorConsole"] = {
+        "appPath": "/usr/bin/ton/validator-engine-console/validator-engine-console",
+        "privKeyPath": "/var/ton-work/keys/client",
+        "pubKeyPath": "/var/ton-work/keys/server.pub",
+        "addr": "127.0.0.1:30304",
+    }
+    with open(ton.local.db_path, "w") as file:
+        json.dump(config, file)
+    for name in ("GetValidatorStatus", "GetValidatorConfig"):
+        monkeypatch.setattr(ton, name, lambda: pytest.fail("premature validator request"))
+    output = cli.execute("status fast", no_color=True)
+    assert "Initialization status:" in output
+    assert "Validator console: unavailable" in output
+    assert "Node ports: 30303" in output
+    assert "premature validator request" not in output
+    assert "timed out" not in output
+
+    for name in ("check_sync", "check_adnl", "check_validator_balance", "check_slashed", "check_node_port",
+                 "check_installer_user", "check_vport"):
+        monkeypatch.setattr(WarningChecker, name, lambda self: pytest.fail("premature validator warning"))
+    monkeypatch.setattr(WarningChecker, "check_mytonctrl_update", lambda self: None)
+    output = cli.run_pre_up(no_color=True)
+    assert "premature validator warning" not in output
+    assert "timed out" not in output
+
+
+def test_completed_initialization_restores_validator_requests(cli, ton, initializing_node, monkeypatch):
+    (initializing_node / "controller/initialized.json").write_text("{}")
+    with open(ton.local.db_path) as file:
+        config = json.load(file)
+    config["validatorConsole"] = {"addr": "127.0.0.1:30304"}
+    with open(ton.local.db_path, "w") as file:
+        json.dump(config, file)
+    calls = []
+    monkeypatch.setattr(ton, "GetValidatorStatus", lambda: calls.append("getstats") or Dict({"is_working": False}))
+    output = cli.execute("status fast", no_color=True)
+    assert "Initialization status: ready" in output
+    assert calls == ["getstats"]
+
+
+@pytest.mark.parametrize("state, detail", [
+    ("STARTING", "starting"), ("BACKOFF", "restarting"), ("EXITED", "failed"),
+    ("FATAL", "failed"), ("RUNNING", "running (initializing)"),
+])
+def test_pending_status_reports_actual_supervisor_state(
+    cli, initializing_node, monkeypatch, state, detail,
+):
+    monkeypatch.setattr(general, "get_service_status", lambda name: state == "RUNNING")
+    monkeypatch.setattr(general, "get_service_state", lambda name: state)
+    output = cli.execute("status fast", no_color=True)
+    assert f"Local validator status: {detail}" in output
+    assert "Local validator status: working" not in output

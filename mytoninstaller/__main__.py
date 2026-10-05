@@ -7,7 +7,7 @@ from pathlib import Path
 from mytoncore.utils import str2bool
 
 from mypylib.mypylib import MyPyClass
-from mypylib.logger import setup_logging
+from mypylib.logger import get_logger, setup_logging
 from mytonctrl.utils import get_current_user, is_container
 
 from mytoninstaller.context import InstallerContext, InstallerPaths, InstallerPorts
@@ -165,13 +165,17 @@ def _configure_controller(local, ctx):
 def mytoninstaller():
     local = MyPyClass(__file__)
     local.db.config.logLevel = "debug"
+    args = _parse_general_args()
+    ctx = get_context(args)
+    if is_container():
+        log_path = Path(ctx.paths.ton_work_dir) / "controller/mytoninstaller.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        local.log_file_name = str(log_path)
     setup_logging(
         local.db.config.logLevel,
         local.log_file_name if local.db.config.isWritingLogFile else None,
         local.db.config.logFileSizeLines if local.db.config.isLimitLogFile else None,
     )
-    args = _parse_general_args()
-    ctx = get_context(args)
     _run_installation_stage(local, ctx, "controller_settings", _configure_controller)
     _run_installation_stage(local, ctx, "node_settings", FirstNodeSettings)
     _run_installation_stage(local, ctx, "validator_console", EnableValidatorConsole)
@@ -187,7 +191,19 @@ def mytoninstaller():
     local.exit()
 
 
-if __name__ == '__main__':
+def main():
     if len(sys.argv) == 1:
         raise Exception("No installation arguments provided")
-    mytoninstaller()
+    try:
+        mytoninstaller()
+    except Exception as error:
+        if not is_container():
+            raise
+        if not get_logger().handlers:
+            setup_logging()
+        get_logger("mytoninstaller").error("Initialization failed: %s", error, exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

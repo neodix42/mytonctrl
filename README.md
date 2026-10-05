@@ -417,6 +417,23 @@ the controller's background tasks start after its client settings are ready.
 Error summaries appear on stdout, while full tracebacks remain in the persistent
 controller log at `/var/ton-work/controller/mytoncore/mytoncore.log`.
 
+An extracted dump means the database import is complete. The validator still
+needs to start and accept console commands before initialization can finish.
+During this stage, console status shows local data and service state without
+running validator-dependent startup checks. A service shown as `starting` or
+`running (initializing)` has not yet completed initialization.
+
+If the validator keeps restarting, inspect its own log and service exit status:
+
+```sh
+docker compose exec mytonctrl tail -n 80 /var/ton-work/log
+docker compose exec mytonctrl systemctl show validator --property=SubState,ExecMainStatus
+```
+
+Installer failures and their full tracebacks are saved in
+`/var/ton-work/controller/mytoninstaller.log`. Keep the data volumes while
+diagnosing a failed start; retries reuse the extracted database.
+
 ### Remove the Docker setup
 
 Remove this Compose setup's containers, named volumes and service images:

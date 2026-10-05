@@ -47,6 +47,8 @@ from mytonctrl.utils import (
     ts_diff_to_human,
     get_service_status,
     get_service_uptime,
+    get_service_state,
+    container_initialization_complete,
     is_container,
 )
 from mytoncore.models import Config15, Config17
@@ -104,7 +106,8 @@ class GeneralModule(MtcModule):
                 self.local.add_log(f"Could not refresh controller settings: {error}", "warning")
 
         # Local status
-        if self.ton.local.db.get("validatorConsole") is None:
+        if (self.ton.local.db.get("validatorConsole") is None
+                or not container_initialization_complete(self.ton)):
             validator_status = Dict()
         else:
             validator_status = self._status_value(self.ton.GetValidatorStatus) or Dict()
@@ -310,9 +313,9 @@ class GeneralModule(MtcModule):
             color_print(node_ip_addr_text)
 
         vconfig = None
-        try:
-            vconfig = self.ton.GetValidatorConfig()
-        except Exception:
+        if validator_status.is_working or not is_container():
+            vconfig = self._status_value(self.ton.GetValidatorConfig)
+        if vconfig is None:
             # The node writes this file before console keys are initialized.
             config = self._read_status_json(paths.ton_db / "config.json")
             if config:
@@ -487,12 +490,25 @@ class GeneralModule(MtcModule):
                 result = bcolors.red_text("not working")
             return result
 
+        def _service_text(name, working):
+            if not is_container():
+                return _get_color_status(working)
+            state = self._status_value(lambda: get_service_state(name))
+            if state in ("STARTING", "BACKOFF", "STOPPING"):
+                detail = {"STARTING": "starting", "BACKOFF": "restarting", "STOPPING": "stopping"}[state]
+                return bcolors.yellow_text(detail)
+            if state in ("EXITED", "FATAL"):
+                return bcolors.red_text("failed")
+            if state == "RUNNING" and not container_initialization_complete(self.ton):
+                return bcolors.yellow_text("running (initializing)")
+            return _get_color_status(working)
+
         mytoncore_status_bool = self._status_value(lambda: get_service_status("mytoncore"))
         mytoncore_uptime = self._status_value(lambda: get_service_uptime("mytoncore")) if mytoncore_status_bool else None
         mytoncore_uptime_text = bcolors.green_text(ts_diff_to_human(mytoncore_uptime)) if mytoncore_uptime is not None else "uptime n/a"
         mytoncore_status_text = self.local.translate(
             "local_status_mytoncore_status"
-        ).format(_get_color_status(mytoncore_status_bool), mytoncore_uptime_text)
+        ).format(_service_text("mytoncore", mytoncore_status_bool), mytoncore_uptime_text)
         print(mytoncore_status_text)
 
         if not is_node_remote:
@@ -501,7 +517,7 @@ class GeneralModule(MtcModule):
             validator_uptime_text = bcolors.green_text(ts_diff_to_human(validator_uptime)) if validator_uptime is not None else "uptime n/a"
             validator_status_text = self.local.translate(
                 "local_status_validator_status"
-            ).format(_get_color_status(validator_status_bool), validator_uptime_text)
+            ).format(_service_text("validator", validator_status_bool), validator_uptime_text)
             print(validator_status_text)
 
         if validator_status.initial_sync:

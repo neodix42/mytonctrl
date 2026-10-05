@@ -4,6 +4,8 @@ import os
 import os.path
 import base64
 import hashlib
+import logging
+import re
 import pwd
 import shlex
 import shutil
@@ -23,6 +25,7 @@ from mypylib.mypylib import (
 	Dict, int2ip
 )
 from mytoncore.models import Paths
+from mytoncore.clients import ValidatorConsole
 from mytonctrl.utils import is_hex, is_container
 from mytoninstaller.archive_blocks import run_process_hardforks, parse_block_value, download_bag, update_init_block, \
 	download_blocks_bag, download_master_blocks_bag
@@ -62,11 +65,111 @@ def _container_validator_threads() -> int:
 	return max(1, cpus - 1)
 
 
+_VALIDATOR_CONSOLE_READY_TIMEOUT = 600
+_VALIDATOR_CONSOLE_POLL_INTERVAL = 2
+_VALIDATOR_CONSOLE_WAIT_LOG_INTERVAL = 30
+
+
+def _validator_log_tail(path: Path) -> str:
+	try:
+		with path.open("rb") as source:
+			source.seek(0, os.SEEK_END)
+			offset = max(0, source.tell() - 8192)
+			source.seek(offset)
+			tail = source.read(8192).decode("utf-8", errors="replace")
+		if offset:
+			tail = tail.partition("\n")[2]
+		return "\n".join(tail.splitlines()[-40:])
+	except OSError:
+		return ""
+
+
+def _validator_failure(local: MyPyClass, message: str, log_path: Path) -> RuntimeError:
+	tail = _validator_log_tail(log_path)
+	logger = getattr(local, "logger", None)
+	if tail and isinstance(logger, logging.Logger):
+		# Preserve diagnostics in the existing installer file log without flooding stdout.
+		record = logger.makeRecord(logger.name, logging.ERROR, __file__, 0,
+								   f"Validator log tail ({log_path}):\n{tail}", (), None)
+		while logger is not None:
+			for handler in logger.handlers:
+				if isinstance(handler, logging.FileHandler) and record.levelno >= handler.level:
+					handler.handle(record)
+			if not logger.propagate:
+				break
+			logger = logger.parent
+	lines = [line.strip() for line in tail.splitlines() if line.strip()]
+	reason = next((line for line in reversed(lines)
+				   if re.search(r"fatal|error|failed|permission denied|assert|cannot|corrupt|unsupported", line, re.IGNORECASE)), "")
+	if reason:
+		message += f". Validator log: {reason[:500]}"
+	return RuntimeError(f"{message}. See {log_path}; node data and dump cache were retained")
+
+
+def _wait_validator_console(local: MyPyClass, ctx: InstallerContext):
+	if not is_container():
+		return
+	keys = Path(ctx.paths.keys_dir)
+	mconfig = GetConfig(ctx.mconfig_path)
+	console_config = mconfig.validatorConsole
+	console = ValidatorConsole(local, console_config.appPath, str(keys / "client"), str(keys / "server.pub"), console_config.addr)
+	log_path = Path(ctx.paths.ton_log_path)
+	started = time.monotonic()
+	deadline = started + _VALIDATOR_CONSOLE_READY_TIMEOUT
+	next_log = started
+	previous_pid = None
+	restarts = 0
+	last_error = "no getstats response"
+	while time.monotonic() < deadline:
+		try:
+			process = subprocess.run(
+				["systemctl", "show", "validator", "--property=SubState,MainPID,ExecMainStatus"],
+				capture_output=True, text=True, timeout=5, check=True,
+			)
+		except (OSError, subprocess.SubprocessError) as error:
+			raise _validator_failure(local, f"Cannot inspect validator startup state: {error}", log_path) from error
+		state = dict(line.split("=", 1) for line in process.stdout.splitlines() if "=" in line)
+		substate = state.get("SubState", "").upper()
+		if substate in ("FATAL", "EXITED", "STOPPED"):
+			raise _validator_failure(local, f"Validator stopped during initialization ({substate}, exit {state.get('ExecMainStatus', 'unknown')})", log_path)
+		try:
+			pid = int(state.get("MainPID", "0"))
+		except ValueError:
+			pid = 0
+		if pid and pid != previous_pid:
+			if previous_pid is not None:
+				restarts += 1
+			previous_pid = pid
+		if restarts >= 3:
+			raise _validator_failure(local, "Validator repeatedly restarted before its console became ready", log_path)
+		if substate == "RUNNING":
+			try:
+				result = console.run("getstats", timeout=5)
+				if re.search(r"(?:^|\n)\s*unixtime\s+[1-9]\d*(?:\s|$)", result):
+					local.add_log("Validator console is ready", "info")
+					return
+				last_error = "getstats did not return validator statistics"
+			except Exception as error:
+				last_error = " ".join(str(error).splitlines())[:250]
+		else:
+			last_error = f"validator service is {substate or 'not running'}"
+		now = time.monotonic()
+		if now >= next_log:
+			local.add_log(f"Waiting for validator console ({int(now - started)}s elapsed): {last_error}", "info")
+			next_log = now + _VALIDATOR_CONSOLE_WAIT_LOG_INTERVAL
+		time.sleep(min(_VALIDATOR_CONSOLE_POLL_INTERVAL, max(0, deadline - now)))
+	raise _validator_failure(local, f"Validator console did not become ready within {_VALIDATOR_CONSOLE_READY_TIMEOUT}s: {last_error}", log_path)
+
+
 def _start_validator(local: MyPyClass):
 	if not is_container():
 		return StartValidator(local)
 	local.add_log("Start/restart validator service", "debug")
-	subprocess.run(["systemctl", "restart", "validator"], check=True)
+	try:
+		subprocess.run(["systemctl", "restart", "validator"], check=True)
+	except subprocess.CalledProcessError as error:
+		log_path = Path(os.getenv("TON_WORK_DIR") or "/var/ton-work") / "log"
+		raise _validator_failure(local, f"Validator service could not start (exit {error.returncode})", log_path) from error
 	time.sleep(10)
 
 
@@ -461,6 +564,7 @@ def _configure_container_validator_console(local: MyPyClass, ctx: InstallerConte
 		privKeyPath=str(keys / "client"), pubKeyPath=str(keys / "server.pub"), addr=f"127.0.0.1:{port}",
 	)
 	SetConfig(ctx.mconfig_path, mconfig)
+	_wait_validator_console(local, ctx)
 	if mconfig.get("containerEnableVcComplete") and (not mconfig.get("validatorWalletName") or not mconfig.get("adnlAddr")):
 		raise RuntimeError("Validator-console setup checkpoint is missing its wallet or ADNL identity")
 	if not mconfig.get("containerEnableVcComplete"):

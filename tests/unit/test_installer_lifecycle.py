@@ -47,6 +47,7 @@ def lifecycle(monkeypatch, tmp_path):
     monkeypatch.setattr(settings.subprocess, "run", run)
     monkeypatch.setattr(settings, "add2systemd", lambda **kwargs: None)
     monkeypatch.setattr(settings, "_start_validator", lambda local: None)
+    monkeypatch.setattr(settings, "_wait_validator_console", lambda local, ctx: None)
     monkeypatch.setattr(settings, "_run_as_installer_user", lambda *args: None)
     return ctx, local, commands
 
@@ -215,7 +216,10 @@ def test_liteserver_retry_finishes_controller_config_without_rotating_key(lifecy
 def test_completed_stages_skip_backup_restore_but_bring_validator_online(lifecycle):
     ctx, local, _ = lifecycle
     calls = []
-    callback = lambda local, ctx: calls.append("called")
+
+    def callback(local, ctx):
+        calls.append("called")
+
     installer._run_installation_stage(local, ctx, "backup_restore", callback)
     installer._run_installation_stage(local, ctx, "backup_restore", callback)
     installer._run_installation_stage(local, ctx, "node_settings", callback)
