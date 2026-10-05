@@ -124,6 +124,8 @@ Edit .env to choose installation arguments and images, then run:
   docker compose pull
   docker compose up -d --no-build --pull never
   docker compose logs -f mytonctrl
+Go inside mytonctrl with:
+  docker compose exec mytonctrl mytonctrl
 
 The exporter is included in the MyTonCtrl image. No extra script download is needed.
 EOF
