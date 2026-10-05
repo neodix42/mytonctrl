@@ -7,6 +7,11 @@ from mypylib.mypylib import Dict
 from mytoninstaller import config
 
 
+@pytest.fixture(autouse=True)
+def container_config(monkeypatch):
+    monkeypatch.setattr(config, "is_container", lambda: True)
+
+
 def test_config_update_preserves_symlink_and_file_permissions(tmp_path):
     target = tmp_path / "config.json"
     target.write_text('{"original": true}')

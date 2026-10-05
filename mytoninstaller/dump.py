@@ -36,11 +36,12 @@ DUMP_COMPLETE_MARKER = ".mytonctrl-dump.json"
 
 def download_dump(local: MyPyClass, ctx: InstallerContext) -> bool:
     local.add_log("start download_dump function", "debug")
-    if is_container():
-        missing = [tool for tool in ("plzip", "aria2c", "tar", "sha256sum") if shutil.which(tool) is None]
-        if missing:
-            local.add_log(f"Missing dump tools in the controller image: {', '.join(missing)}", "error")
-            return False
+    if not is_container():
+        return _download_host_dump(local, ctx)
+    missing = [tool for tool in ("plzip", "aria2c", "tar", "sha256sum") if shutil.which(tool) is None]
+    if missing:
+        local.add_log(f"Missing dump tools in the controller image: {', '.join(missing)}", "error")
+        return False
     dump_dir = os.path.abspath(ctx.paths.ton_db_dir)
     dump_cache_dir = os.path.abspath(get_dump_cache_dir(ctx.paths.ton_work_dir))
     os.makedirs(dump_dir, exist_ok=True)
@@ -58,6 +59,111 @@ def download_dump(local: MyPyClass, ctx: InstallerContext) -> bool:
     except (OSError, ValueError, requests.RequestException) as exc:
         local.add_log(f"Dump setup failed; cached files are preserved: {exc}", "error")
         return False
+
+
+def _download_host_dump(local: MyPyClass, ctx: InstallerContext) -> bool:
+    # Preserve the native workflow: each call fetches a fresh dump and cleans its temporary files.
+    base_url = "https://dump.ton.org/dumps"
+    dump_name = "latest"
+    if is_testnet(ctx.paths.global_config_path):
+        dump_name += '_testnet'
+    dump_dir = ctx.paths.ton_db_dir
+    dump_cache_dir = get_dump_cache_dir(ctx.paths.ton_work_dir)
+    os.makedirs(dump_dir, exist_ok=True)
+    os.makedirs(dump_cache_dir, exist_ok=True)
+    cleanup_dump_temp_files(local, os.path.join(dump_dir, "latest.tar.lz"))
+    cleanup_dump_temp_files(local, os.path.join(dump_cache_dir, "latest.tar.lz"))
+
+    try:
+        dump_metadata = get_dump_metadata(base_url, dump_name)
+    except Exception as e:
+        local.add_log(f"Failed to get dump metadata: {e}", "error")
+        return False
+
+    archive_name = dump_metadata.archive_name
+    temp_file = os.path.join(dump_cache_dir, archive_name)
+    cleanup_dump_temp_files(local, os.path.join(dump_dir, archive_name))
+    cleanup_dump_temp_files(local, temp_file)
+    print("dumpName:", archive_name)
+    print("dumpSize:", dump_metadata.archive_size)
+    print("dumpDiskSize:", dump_metadata.disk_size)
+    print("dumpCacheDir:", dump_cache_dir)
+    if not check_dump_space(local, dump_dir, dump_cache_dir, dump_metadata):
+        return False
+
+    # apt install
+    apt_result = subprocess.run(["apt", "install", "plzip", "aria2", "curl", "-y"]).returncode
+    if apt_result != 0:
+        local.add_log(f"Failed to install dump tools with exit code {apt_result}", "error")
+        return False
+
+    # download dump using aria2c to a temporary file
+    cmd = [
+        "aria2c",
+        "-x", "8",
+        "-s", "8",
+        "--enable-http-keep-alive=false",
+        "--retry-wait=5",
+        "--max-tries=20",
+        "--connect-timeout=60",
+        "--timeout=120",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=true",
+        "--check-integrity=true",
+        f"--checksum=sha-256={dump_metadata.sha256}",
+        "-c",
+        f"{base_url}/{archive_name}",
+        "-d", dump_cache_dir,
+        "-o", archive_name,
+    ]
+    download_started_at = time.monotonic()
+    download_result = subprocess.run(cmd).returncode
+    download_elapsed = format_elapsed_time(time.monotonic() - download_started_at)
+    if download_result != 0 or not os.path.exists(temp_file):
+        local.add_log(f"Dump download failed after {download_elapsed}: {temp_file}", "error")
+        cleanup_dump_temp_files(local, temp_file)
+        return False
+    if os.path.getsize(temp_file) != dump_metadata.archive_size:
+        local.add_log(f"Dump download size mismatch after {download_elapsed}: {temp_file}", "error")
+        cleanup_dump_temp_files(local, temp_file)
+        return False
+    checksum_started_at = time.monotonic()
+    checksum_result = verify_dump_checksum(local, dump_cache_dir, archive_name, dump_metadata.sha256)
+    checksum_elapsed = format_elapsed_time(time.monotonic() - checksum_started_at)
+    if checksum_result is False:
+        local.add_log(f"Dump checksum verification failed after {checksum_elapsed}: {temp_file}", "error")
+        cleanup_dump_temp_files(local, temp_file)
+        return False
+    local.add_log(f"Dump checksum verified in {checksum_elapsed}: {temp_file}", "info")
+
+    if dump_bool_env("DUMP_VALIDATE_BEFORE_EXTRACT", False):
+        validation_started_at = time.monotonic()
+        validation_result = validate_dump_archive(local, temp_file)
+        validation_elapsed = format_elapsed_time(time.monotonic() - validation_started_at)
+        if validation_result != 0:
+            local.add_log(f"Dump lzip validation failed after {validation_elapsed}: {temp_file}", "error")
+            cleanup_dump_temp_files(local, temp_file)
+            return False
+        local.add_log(f"Dump lzip validation succeeded in {validation_elapsed}: {temp_file}", "info")
+
+    # process the downloaded file
+    msg = f"Dump downloaded to {temp_file} in {download_elapsed}. Starting extraction to {dump_dir}"
+    print(msg, flush=True)
+    local.add_log(msg, "info")
+    extraction_started_at = time.monotonic()
+    extraction_result = extract_dump(local, temp_file, dump_dir)
+    extraction_elapsed = format_elapsed_time(time.monotonic() - extraction_started_at)
+    if extraction_result != 0:
+        local.add_log(f"Dump extraction failed after {extraction_elapsed}", "error")
+        cleanup_dump_temp_files(local, temp_file)
+        return False
+    msg = f"Dump extracted to {dump_dir} in {extraction_elapsed}"
+    print(msg, flush=True)
+    local.add_log(msg, "info")
+
+    # clean up the temporary file after processing
+    cleanup_dump_temp_files(local, temp_file)
+    return True
 
 
 def _download_dump(local: MyPyClass, ctx: InstallerContext, dump_dir: str, dump_cache_dir: str) -> bool:
@@ -114,12 +220,6 @@ def _download_dump(local: MyPyClass, ctx: InstallerContext, dump_dir: str, dump_
     print("dumpCacheDir:", dump_cache_dir)
     if not check_dump_space(local, dump_dir, dump_cache_dir, metadata):
         return False
-    if not is_container():
-        apt_result = subprocess.run(["apt", "install", "plzip", "aria2", "curl", "-y"]).returncode
-        if apt_result != 0:
-            local.add_log(f"Failed to install dump tools with exit code {apt_result}", "error")
-            return False
-
     verified = False
     if os.path.exists(temp_file):
         fingerprint = dump_file_fingerprint(temp_file)
@@ -195,8 +295,6 @@ def _download_dump(local: MyPyClass, ctx: InstallerContext, dump_dir: str, dump_
     msg = f"Dump extracted to {dump_dir} in {extraction_elapsed}"
     print(msg, flush=True)
     local.add_log(msg, "info")
-    if not is_container():
-        cleanup_dump_temp_files(local, temp_file)
     return True
 
 
@@ -364,24 +462,29 @@ def allocated_database_bytes(dump_dir: str, dump_cache_dir: Optional[str] = None
 
 
 def check_dump_space(local: MyPyClass, dump_dir: str, dump_cache_dir: str, dump_metadata: DumpMetadata) -> bool:
-    # aria2 may preallocate its target. Account for allocated blocks, rather
-    # than its apparent file size, and for database files from partial extraction.
-    archive_path = os.path.join(dump_cache_dir, dump_metadata.archive_name)
-    archive_size = max(0, dump_metadata.archive_size - allocated_dump_bytes(archive_path))
-    disk_size = max(0, dump_metadata.disk_size - allocated_database_bytes(dump_dir, dump_cache_dir))
+    archive_size = dump_metadata.archive_size
+    disk_size = dump_metadata.disk_size
+    space_label = ""
+    if is_container():
+        # Container restarts can reuse already allocated archive and partial
+        # database blocks. A native refresh retains its original full-space check.
+        archive_path = os.path.join(dump_cache_dir, dump_metadata.archive_name)
+        archive_size = max(0, archive_size - allocated_dump_bytes(archive_path))
+        disk_size = max(0, disk_size - allocated_database_bytes(dump_dir, dump_cache_dir))
+        space_label = " more bytes"
     dump_usage = psutil.disk_usage(dump_dir)
     cache_usage = psutil.disk_usage(dump_cache_dir)
     if os.stat(dump_dir).st_dev == os.stat(dump_cache_dir).st_dev:
         need_space = archive_size + disk_size
         if need_space > dump_usage.free:
-            local.add_log(f"Not enough disk space in {dump_dir}: need {need_space} more bytes, free {dump_usage.free}", "error")
+            local.add_log(f"Not enough disk space in {dump_dir}: need {need_space}{space_label}, free {dump_usage.free}", "error")
             return False
         return True
     if archive_size > cache_usage.free:
-        local.add_log(f"Not enough disk space in {dump_cache_dir}: need {archive_size} more bytes, free {cache_usage.free}", "error")
+        local.add_log(f"Not enough disk space in {dump_cache_dir}: need {archive_size}{space_label}, free {cache_usage.free}", "error")
         return False
     if disk_size > dump_usage.free:
-        local.add_log(f"Not enough disk space in {dump_dir}: need {disk_size} more bytes, free {dump_usage.free}", "error")
+        local.add_log(f"Not enough disk space in {dump_dir}: need {disk_size}{space_label}, free {dump_usage.free}", "error")
         return False
     return True
 
@@ -390,10 +493,34 @@ def get_dump_metadata(base_url: str, dump_name: str) -> DumpMetadata:
     latest_name = dump_fetch_text(f"{base_url}/{dump_name}.tar.name.txt", timeout=10)
     if not latest_name:
         raise RuntimeError(f"empty dump name for {dump_name}")
-    archive_name = os.path.basename(latest_name)
+    metadata_name = os.path.basename(latest_name)
+    archive_name = metadata_name
     if not archive_name.endswith(".lz"):
         archive_name += ".lz"
-    return get_archive_metadata(base_url, archive_name)
+    else:
+        metadata_name = archive_name[:-3]
+    if is_container():
+        return get_archive_metadata(base_url, archive_name)
+
+    # Keep native metadata handling compatible with the original fresh-dump workflow.
+    sha_text = dump_fetch_text(f"{base_url}/{metadata_name}.sha256sum.txt", timeout=10)
+    sha_parts = sha_text.split()
+    if not sha_parts:
+        raise RuntimeError(f"empty dump sha256 for {metadata_name}")
+    sha256 = sha_parts[0]
+    if len(sha256) != 64:
+        raise RuntimeError(f"invalid dump sha256 for {metadata_name}: {sha256}")
+    if len(sha_parts) > 1 and os.path.basename(sha_parts[1]) != archive_name:
+        raise RuntimeError(f"dump sha256 file does not match archive {archive_name}: {sha_parts[1]}")
+
+    archive_size = int(dump_fetch_text(f"{base_url}/{metadata_name}.size.archive.txt", timeout=10))
+    disk_size = int(dump_fetch_text(f"{base_url}/{metadata_name}.size.disk.txt", timeout=10))
+    return DumpMetadata(
+        archive_name=archive_name,
+        sha256=sha256,
+        archive_size=archive_size,
+        disk_size=disk_size,
+    )
 
 
 def get_archive_metadata(base_url: str, archive_name: str) -> DumpMetadata:
@@ -468,11 +595,13 @@ def format_elapsed_time(elapsed: float) -> str:
 def extract_dump(local: MyPyClass, temp_file: str, dump_dir: str) -> int:
     threads = dump_extract_threads()
     local.add_log(f"Extracting dump with plzip regular-file input: file={temp_file} dir={dump_dir} threads={threads}", "info")
-    # A dump contains blockchain data, never this node's identity. Exclusions
-    # also apply to ./ prefixes and nested directories in older dump layouts.
-    protected = ("config.json", "keyring", "keys", "nodekeys", DUMP_COMPLETE_MARKER)
-    exclusions = " ".join(f"--exclude={name} --exclude=*/{name}" for name in protected)
-    extract_cmd = f'plzip -cd -n"$3" -- "$1" | tar -xf - -C "$2" {exclusions}'
+    extract_cmd = 'plzip -cd -n"$3" -- "$1" | tar -xf - -C "$2"'
+    if is_container():
+        # Container retry extraction must preserve this node's identity.
+        # Native extraction keeps the original archive contents unchanged.
+        protected = ("config.json", "keyring", "keys", "nodekeys", DUMP_COMPLETE_MARKER)
+        exclusions = " ".join(f"--exclude={name} --exclude=*/{name}" for name in protected)
+        extract_cmd += " " + exclusions
     # Use bash for pipefail so decompressor and tar failures are both surfaced.
     result = subprocess.run([
         "bash", "-o", "pipefail", "-c", extract_cmd,

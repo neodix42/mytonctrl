@@ -8,6 +8,7 @@ import requests
 
 from mypylib import MyPyClass
 from mytoninstaller.context import InstallerContext
+from mytonctrl.utils import is_container
 
 from mytoninstaller.utils import get_ed25519_pubkey_text
 from mypylib.mypylib import ip2int, Dict
@@ -22,6 +23,10 @@ def GetConfig(path: str):
 
 def SetConfig(path: str, data: Dict):
 	text = json.dumps(data, indent=4)
+	if not is_container():
+		with open(path, 'wt') as f:
+			f.write(text)
+		return
 	target = Path(path).resolve()
 	previous = target.stat() if target.exists() else None
 	temporary = None

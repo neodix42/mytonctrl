@@ -22,9 +22,10 @@ class WarningChecker:
         self.ton = ton
 
     def validator_checks_ready(self):
-        return self.ton.local.db.get(
-            "validatorConsole"
-        ) is not None and container_initialization_complete(self.ton)
+        return not is_container() or (
+            self.ton.local.db.get("validatorConsole") is not None
+            and container_initialization_complete(self.ton)
+        )
 
     def print_warning(self, warning_name: str):
         color_print(
@@ -211,10 +212,12 @@ class WarningChecker:
             self.local.try_function(self.check_sync)
             self.local.try_function(self.check_adnl)
             self.local.try_function(self.check_validator_balance)
-            self.local.try_function(self.check_slashed)
-            self.local.try_function(self.check_node_port)
         self.local.try_function(self.check_vps)
         self.local.try_function(self.check_tg_channel)
+        if self.validator_checks_ready():
+            self.local.try_function(self.check_slashed)
         self.local.try_function(self.check_ubuntu_version)
+        if self.validator_checks_ready():
+            self.local.try_function(self.check_node_port)
         self.local.try_function(self.check_ton_http_api_version)
         self.local.try_function(self.check_nominator_pool_deprecated)

@@ -6,6 +6,8 @@ from mypylib.mypylib import Dict
 from modules import general
 from mytonctrl.warnings import WarningChecker
 from mytonctrl import utils
+from mytonctrl import mytonctrl as application
+from mytonctrl import warnings
 from tests.conftest import TestLocal, TestMyPyConsole
 
 
@@ -28,6 +30,8 @@ def initializing_node(ton, tmp_path, monkeypatch):
         json.dump(ton.local.db, config)
     monkeypatch.setattr(general, "is_container", lambda: True)
     monkeypatch.setattr(utils, "is_container", lambda: True)
+    monkeypatch.setattr(application, "is_container", lambda: True)
+    monkeypatch.setattr(warnings, "is_container", lambda: True)
     monkeypatch.setattr(general, "get_service_status", lambda name: False)
     monkeypatch.setattr(general, "get_service_state", lambda name: "STOPPED")
     monkeypatch.setattr(general, "get_service_uptime", lambda name: None)

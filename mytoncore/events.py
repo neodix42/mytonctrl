@@ -37,13 +37,15 @@ def enable_vc_event(local: MyPyClass, event_name: str):
     adnl_addr = local.db.get("adnlAddr") if container else None
     if not adnl_addr:
         adnl_addr = ton.CreateNewKey()
-        local.db["adnlAddr"] = adnl_addr
         if container:
             # Persist the identity before attaching it so an interrupted retry reuses it.
+            local.db["adnlAddr"] = adnl_addr
             local.save()
     added = ton.add_adnl_addr(adnl_addr)
     if container and not added:
         raise RuntimeError("Failed to add the validator ADNL address; its key was retained for retry")
+    if not container:
+        local.db["adnlAddr"] = adnl_addr
     local.save()
 
     args = event_name.split("_")[1:]

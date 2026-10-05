@@ -6,6 +6,7 @@ from mypylib import MyPyClass
 from mytoncore.utils import get_package_resource_path
 from mytoncore.mytoncore import MyTonCore
 from mytonctrl.warnings import WarningChecker
+from mytonctrl.utils import is_container
 
 
 class MyTonCtrl:
@@ -127,7 +128,7 @@ class MyTonCtrl:
         self.local.db.config.isLocaldbSaving = False
         self.local.run()
 
-        if cmd is None:
+        if cmd is None and is_container():
             from modules.general import GeneralModule
 
             try:

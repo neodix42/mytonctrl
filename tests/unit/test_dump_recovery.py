@@ -271,6 +271,7 @@ def test_cleanup_removes_only_pinned_archive_after_completed_initialization(harn
 
 
 def test_resume_space_check_credits_allocated_archive_and_database_blocks(monkeypatch, tmp_path):
+    monkeypatch.setenv("MYTONCTRL_CONTAINER", "1")
     cache = tmp_path / "cache"
     database = tmp_path / "db"
     cache.mkdir()
@@ -290,6 +291,7 @@ def test_resume_space_check_credits_allocated_archive_and_database_blocks(monkey
 
 @pytest.mark.parametrize("cache_name", ["cache", "."])
 def test_cache_inside_database_is_not_counted_as_extracted_data(monkeypatch, tmp_path, cache_name):
+    monkeypatch.setenv("MYTONCTRL_CONTAINER", "1")
     database = tmp_path / "db"
     cache = database / cache_name
     cache.mkdir(parents=True)
@@ -305,6 +307,7 @@ def test_cache_inside_database_is_not_counted_as_extracted_data(monkeypatch, tmp
 
 @pytest.mark.parametrize("prefix", ["", "./"])
 def test_real_tar_extraction_protects_node_config_and_keys(monkeypatch, tmp_path, prefix):
+    monkeypatch.setenv("MYTONCTRL_CONTAINER", "1")
     database = tmp_path / "db"
     database.mkdir()
     protected = ["config.json", "keyring/private", "keys/client", "nodekeys/private", dump.DUMP_COMPLETE_MARKER]

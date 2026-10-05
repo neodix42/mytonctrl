@@ -8,6 +8,11 @@ The extended documentation can be found at https://docs.ton.org/v3/documentation
 
 ## Host installation
 
+Native installations use the host installer and systemd services. Docker-specific
+initialization checkpoints, dump recovery and validator readiness polling apply
+only inside the MyTonCtrl image. Native installations keep their existing
+installation, console, backup and upgrade workflows.
+
 ### Operating systems
 
 It is recommended to use Ubuntu 22.04 LTS or Ubuntu 24.04 LTS for using MyTonCtrl. However, the full list of tested OS is below:

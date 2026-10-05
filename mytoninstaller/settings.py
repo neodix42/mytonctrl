@@ -210,10 +210,7 @@ def FirstNodeSettings(local: MyPyClass, ctx: InstallerContext):
 	marker = Path(ton_work_dir) / "controller/node-initialized.json"
 
 	existing_config = os.path.isfile(vconfig_path)
-	if existing_config and not container:
-		local.add_log(f"Validators config '{vconfig_path}' already exist. Break FirstNodeSettings fuction", "warning")
-		return
-	if existing_config:
+	if existing_config and container:
 		vconfig = GetConfig(vconfig_path)
 		if not vconfig.get("addrs") or not isinstance(vconfig.get("control"), list) or not isinstance(vconfig.get("liteservers"), list):
 			raise RuntimeError(f"Existing validator configuration is incomplete: {vconfig_path}; retained node keys and data were not replaced")
@@ -235,6 +232,9 @@ def FirstNodeSettings(local: MyPyClass, ctx: InstallerContext):
 		archive_ttl -= state_ttl
 	if archive_ttl == 0:
 		archive_ttl = 1
+	if existing_config and not container:
+		local.add_log(f"Validators config '{vconfig_path}' already exist. Break FirstNodeSettings fuction", "warning")
+		return
 
 	with open("/etc/passwd", 'rt') as file:
 		text = file.read()
@@ -275,7 +275,7 @@ def FirstNodeSettings(local: MyPyClass, ctx: InstallerContext):
 		local.add_log("Use addr: " + addr, "debug")
 		local.add_log("First start validator - create config.json", "debug")
 		args = [validatorAppPath, "--global-config", globalConfigPath, "--db", ton_db_dir, "--ip", addr, "--logname", tonLogPath]
-		subprocess.run(args, check=True)
+		subprocess.run(args, check=container)
 		if container and not os.path.isfile(vconfig_path):
 			raise RuntimeError("Validator initialization did not create config.json")
 
@@ -759,7 +759,8 @@ def EnableValidatorConsole(local: MyPyClass, ctx: InstallerContext):
 	if ctx.ports.quic is not None:
 		event_name += f'_{ctx.ports.quic}'
 
-	_run_as_installer_user(user, [sys.executable, "-m", "mytoncore", "-e", event_name])
+	cmd = f'{sys.executable} -m mytoncore -e "{event_name}"'
+	subprocess.run(["su", "-l", user, "-c", cmd])
 
 	# restart mytoncore
 	_start_mytoncore(local)

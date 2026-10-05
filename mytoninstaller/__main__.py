@@ -98,7 +98,9 @@ def get_context(args) -> InstallerContext:
     archive_ttl = int(archive_ttl_env) if archive_ttl_env else None
     state_ttl_env = os.getenv('STATE_TTL')
     state_ttl = int(state_ttl_env) if state_ttl_env else None
-    public_ip = (os.getenv('PUBLIC_IP') or '').strip() or None
+    public_ip = os.getenv('PUBLIC_IP')
+    if is_container():
+        public_ip = (public_ip or '').strip() or None
     add_shard = os.getenv('ADD_SHARD')
     archive_blocks = os.getenv('ARCHIVE_BLOCKS')
 
@@ -162,20 +164,27 @@ def _configure_controller(local, ctx):
     write_paths(local, ctx)
 
 
-def mytoninstaller():
-    local = MyPyClass(__file__)
-    local.db.config.logLevel = "debug"
-    args = _parse_general_args()
-    ctx = get_context(args)
-    if is_container():
-        log_path = Path(ctx.paths.ton_work_dir) / "controller/mytoninstaller.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        local.log_file_name = str(log_path)
+def _setup_installer_logging(local):
     setup_logging(
         local.db.config.logLevel,
         local.log_file_name if local.db.config.isWritingLogFile else None,
         local.db.config.logFileSizeLines if local.db.config.isLimitLogFile else None,
     )
+
+
+def mytoninstaller():
+    local = MyPyClass(__file__)
+    local.db.config.logLevel = "debug"
+    container = is_container()
+    if not container:
+        _setup_installer_logging(local)
+    args = _parse_general_args()
+    ctx = get_context(args)
+    if container:
+        log_path = Path(ctx.paths.ton_work_dir) / "controller/mytoninstaller.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        local.log_file_name = str(log_path)
+        _setup_installer_logging(local)
     _run_installation_stage(local, ctx, "controller_settings", _configure_controller)
     _run_installation_stage(local, ctx, "node_settings", FirstNodeSettings)
     _run_installation_stage(local, ctx, "validator_console", EnableValidatorConsole)
