@@ -339,15 +339,6 @@ docker compose exec mytonctrl sudo systemctl start validator
 docker compose exec mytonctrl sudo systemctl start mytoncore
 ```
 
-`source` is a shell command and is not accepted at the `MyTonCtrl>` prompt.
-This image already provides the benchmark runtime; no shell activation is
-needed. Benchmark support requires the optional TON artifacts `create-state`,
-`dht-server` and `libtonlibjson.so`, which the official TON image exports. If
-these are missing from a custom mount, supply them and recreate the controller.
-The framework is pinned to a TON revision at image build time; custom builds
-can select a compatible revision with Docker build argument
-`TON_BENCHMARK_REVISION` (a full Git commit hash).
-
 ### Build from a local checkout (optional)
 
 For development, use the repository root's `compose.yaml`, which supports
