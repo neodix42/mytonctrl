@@ -299,6 +299,55 @@ check default. Explicit console arguments take precedence for options with value
 The publishing workflows use `dev` for commits to `dev`, `latest` for commits to
 `master`, and a required tag input for manual builds.
 
+### Run a benchmark
+
+The controller image includes `uv`, Python 3.14 and TON's Python benchmark
+framework with its generated bindings. The benchmark uses the binaries and
+Fift resources supplied by the separate TON image; it does not download a
+repository, install dependencies or compile TON when invoked.
+
+View the benchmark options without stopping the node:
+
+```sh
+docker compose exec mytonctrl mytonctrl --cmd "benchmark --help"
+```
+
+The benchmark starts a temporary local TON network and measures its workload.
+After node initialization completes, stop the live controller and validator
+services before running it. Run these commands in your host shell, outside the
+`MyTonCtrl>` prompt (type `exit` to leave the console):
+
+```sh
+docker compose exec mytonctrl sudo systemctl stop mytoncore
+docker compose exec mytonctrl sudo systemctl stop validator
+docker compose exec mytonctrl mytonctrl --cmd "benchmark --nodes 2 --duration 60"
+```
+
+Stopping these services keeps the container running. Pass workload options
+such as `--tps`, `--shards`, `--spammers` or `--sync-test` to `benchmark`. Use
+`--tmp-dir /mounted/path` to select benchmark storage; its default parent is
+`/var/ton-work/tmp`. Each run uses a separate temporary directory and removes
+its test network afterward. The container manages `--build-dir`, `--source-dir`
+and `--work-dir` to keep benchmark cleanup separate from the live node's data.
+Its database, keys, wallet and dump cache are retained.
+
+Restart the live services after the benchmark, including if it failed or was
+interrupted:
+
+```sh
+docker compose exec mytonctrl sudo systemctl start validator
+docker compose exec mytonctrl sudo systemctl start mytoncore
+```
+
+`source` is a shell command and is not accepted at the `MyTonCtrl>` prompt.
+This image already provides the benchmark runtime; no shell activation is
+needed. Benchmark support requires the optional TON artifacts `create-state`,
+`dht-server` and `libtonlibjson.so`, which the official TON image exports. If
+these are missing from a custom mount, supply them and recreate the controller.
+The framework is pinned to a TON revision at image build time; custom builds
+can select a compatible revision with Docker build argument
+`TON_BENCHMARK_REVISION` (a full Git commit hash).
+
 ### Build from a local checkout (optional)
 
 For development, use the repository root's `compose.yaml`, which supports

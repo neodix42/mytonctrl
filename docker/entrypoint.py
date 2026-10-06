@@ -29,6 +29,9 @@ BINARY_LAYOUT = {
     "generate-random-id": "utils/generate-random-id",
     "fift": "crypto/fift", "func": "crypto/func", "create-state": "crypto/create-state",
     "dht-server": "dht-server/dht-server",
+    "libtonlibjson.so": "tonlib/libtonlibjson.so",
+    "libemulator.so": "emulator/libemulator.so",
+    "blockchain-explorer": "blockchain-explorer/blockchain-explorer",
     "tonutils-storage": "tonutils-storage/tonutils-storage",
 }
 INITIALIZATION_SETTINGS = (

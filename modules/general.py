@@ -1460,6 +1460,9 @@ class GeneralModule(MtcModule):
             color_print("reload_global_config - {red}Error{endc}")
 
     def run_benchmark(self, args: list[str]):
+        if is_container():
+            return self._run_container_benchmark(args)
+
         if shutil.which("uv") is None:
             answer = input("uv is not installed. Install it? [y/n] ").strip().lower()
             if answer == "y":
@@ -1567,6 +1570,31 @@ class GeneralModule(MtcModule):
                     str(tmp_dir / "test" / "integration" / ".network"),
                 ] + args
                 subprocess.run(cmd, cwd=tmp_dir)
+
+    def _run_container_benchmark(self, args: list[str]):
+        if not any(arg in ("--help", "-h") for arg in args):
+            if not container_initialization_complete(self.ton):
+                color_print("{red}Error: wait for node initialization to finish before running benchmark.{endc}")
+                return
+            state = get_service_state("validator")
+            if state not in ("STOPPED", "FATAL"):
+                color_print(
+                    f"{{red}}Error: validator service state is {state or 'unknown'}. "
+                    "Stop it before running benchmark.{endc}\n"
+                    "Run these commands in the host shell:\n"
+                    "docker compose exec mytonctrl sudo systemctl stop mytoncore\n"
+                    "docker compose exec mytonctrl sudo systemctl stop validator"
+                )
+                return
+
+        paths = self.ton.get_paths()
+        subprocess.run([
+            sys.executable, "/usr/local/lib/mytonctrl/benchmark.py",
+            "--build-dir", str(paths.ton_bin),
+            "--source-dir", str(paths.ton_src),
+            "--work-root", str(paths.ton_work),
+            "--", *args,
+        ], check=True)
 
     def about(self, args: list[str]):
         from modules import get_mode, get_mode_settings
