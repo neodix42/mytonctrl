@@ -181,6 +181,9 @@ The MyTonCtrl image initializes and runs the node using those mounted artifacts.
 It requires the artifacts to be mounted before startup. Node state, keys,
 wallets and controller settings persist in a separate work volume.
 
+Use the Compose quick setup below, or follow
+[the examples without Docker Compose](#use-docker-without-compose).
+
 ### Quick setup
 
 With Docker and Compose installed on Linux, prepare an empty deployment directory:
@@ -262,8 +265,9 @@ Docker supports these adaptations of the host arguments:
 | `-s`, `--no-startup-checks` | Docker extension: add to `MYTONCTRL_ARGS` to skip console startup checks. Installation flags are kept separate from console arguments. |
 
 Mount files referenced by `-c`, `-p` or `-e` into the controller using Compose
-volumes. `--archive` also requires a mounted prebuilt `tonutils-storage` executable;
-see [Docker environment options](docker/README.md#environment-options).
+volumes or Docker's `--mount` option. `--archive` also requires a mounted
+prebuilt `tonutils-storage` executable; see
+[Docker environment options](docker/README.md#environment-options).
 
 ### Start and open the console
 
@@ -429,6 +433,185 @@ Recreation also adopts the currently exported TON release. Use these image
 updates for container deployments; the console's `update` and `upgrade` commands
 refer to this workflow. A container restart alone does not replace its controller
 image or reload `.env` changes.
+
+### Use Docker without Compose
+
+These examples use Docker directly on Linux, with the same two images and
+persistent volumes as the Compose setup. Run them from your deployment
+directory. Keep the image and volume variables available in your shell; in a
+new terminal, set them again to the values used for this installation.
+
+#### Set up and open the console
+
+Prepare an empty directory and download the environment template:
+
+```sh
+mkdir mytonctrl-docker &&
+  cd mytonctrl-docker &&
+  wget -O .env https://raw.githubusercontent.com/neodiX42/mytonctrl/master/.env.example
+```
+
+Edit `.env` with the same [installation arguments](#installation-arguments-in-env)
+and `PUBLIC_IP` settings described above. For a published controller, set
+`MYTONCTRL_IMAGE=ghcr.io/neodix42/mytonctrl:latest` in that file. Then set the
+following shell variables to match your chosen image references and volume
+names in `.env`:
+
+```sh
+TON_IMAGE=ghcr.io/ton-blockchain/ton:latest
+MYTONCTRL_IMAGE=ghcr.io/neodix42/mytonctrl:latest
+TON_SCRIPTS_VOLUME=mytonctrl-ton-scripts
+TON_ARTIFACTS_VOLUME=mytonctrl-ton-artifacts
+TON_WORK_VOLUME=mytonctrl-ton-work
+
+docker pull "$MYTONCTRL_IMAGE"
+docker pull "$TON_IMAGE"
+docker volume create "$TON_SCRIPTS_VOLUME"
+docker volume create "$TON_ARTIFACTS_VOLUME"
+docker volume create "$TON_WORK_VOLUME"
+```
+
+Docker's [`--env-file`](https://docs.docker.com/reference/cli/docker/container/run/#env)
+passes settings to the container; it does not choose the image or volume names
+in these shell commands. Keep `MYTONCTRL_ARGS` unquoted as in `.env.example`,
+and use literal values rather than `${VARIABLE}` substitutions in `.env`.
+
+Copy the exporter bundled in the controller image into the script volume:
+
+```sh
+docker run --rm --pull never --network none --entrypoint /bin/sh \
+  --mount "type=volume,src=$TON_SCRIPTS_VOLUME,dst=/scripts" \
+  "$MYTONCTRL_IMAGE" -eu -c '
+    staged_script=$(mktemp /scripts/.export-ton.sh.XXXXXX)
+    trap "rm -f \"$staged_script\"" EXIT
+    cp /usr/local/lib/mytonctrl/export-ton.sh "$staged_script"
+    chmod 444 "$staged_script"
+    mv -f "$staged_script" /scripts/export-ton.sh
+  '
+```
+
+Export TON's binaries and Fift resources using the official image with its
+`init.sh` entrypoint replaced. This helper exits after publishing the artifacts:
+
+```sh
+docker run --rm --pull never --network none --entrypoint /bin/sh \
+  --env "TON_IMAGE_REF=$TON_IMAGE" \
+  --mount "type=volume,src=$TON_ARTIFACTS_VOLUME,dst=/ton-artifacts" \
+  --mount "type=volume,src=$TON_SCRIPTS_VOLUME,dst=/scripts,readonly" \
+  "$TON_IMAGE" /scripts/export-ton.sh
+```
+
+Start the controller with the artifact volume read-only and the work volume
+persistent. These examples use the default work path `/var/ton-work`; if you
+select a different path with `-W`, mount the work volume at that path instead.
+
+```sh
+docker run -d --name mytonctrl --pull never --network host \
+  --restart unless-stopped --stop-timeout 75 --env-file .env \
+  --mount "type=volume,src=$TON_ARTIFACTS_VOLUME,dst=/ton-artifacts,readonly" \
+  --mount "type=volume,src=$TON_WORK_VOLUME,dst=/var/ton-work" \
+  "$MYTONCTRL_IMAGE"
+docker logs -f mytonctrl
+```
+
+Open the console in another terminal, or run a single command:
+
+```sh
+docker exec -it mytonctrl mytonctrl
+docker exec mytonctrl mytonctrl --cmd status
+```
+
+#### Stop and resume
+
+Stop the container while retaining its data, then start it again when needed:
+
+```sh
+docker stop mytonctrl
+docker start mytonctrl
+```
+
+Stopping uses the 75-second grace period configured above. Starting or restarting
+retains the container's image and environment. Recreate it using the controller
+upgrade commands below to load a changed image or `.env` file.
+
+#### Upgrade TON independently
+
+Set `TON_IMAGE` to the desired tag or digest in `.env` and in your shell, then
+pull and export it. For example, to refresh the `latest` tag:
+
+```sh
+TON_IMAGE=ghcr.io/ton-blockchain/ton:latest
+docker pull "$TON_IMAGE"
+docker run --rm --pull never --network none --entrypoint /bin/sh \
+  --env "TON_IMAGE_REF=$TON_IMAGE" \
+  --mount "type=volume,src=$TON_ARTIFACTS_VOLUME,dst=/ton-artifacts" \
+  --mount "type=volume,src=$TON_SCRIPTS_VOLUME,dst=/scripts,readonly" \
+  "$TON_IMAGE" /scripts/export-ton.sh
+```
+
+The running controller continues using its existing TON binaries. Adopt the
+newly exported release when ready:
+
+```sh
+docker restart mytonctrl
+```
+
+This keeps the work volume, keys, wallets and downloaded dump data.
+
+#### Upgrade MyTonCtrl
+
+Set `MYTONCTRL_IMAGE` to the desired tag or digest in `.env` and in your shell.
+Pull it and refresh the packaged exporter for future TON exports:
+
+```sh
+MYTONCTRL_IMAGE=ghcr.io/neodix42/mytonctrl:latest
+docker pull "$MYTONCTRL_IMAGE"
+docker run --rm --pull never --network none --entrypoint /bin/sh \
+  --mount "type=volume,src=$TON_SCRIPTS_VOLUME,dst=/scripts" \
+  "$MYTONCTRL_IMAGE" -eu -c '
+    staged_script=$(mktemp /scripts/.export-ton.sh.XXXXXX)
+    trap "rm -f \"$staged_script\"" EXIT
+    cp /usr/local/lib/mytonctrl/export-ton.sh "$staged_script"
+    chmod 444 "$staged_script"
+    mv -f "$staged_script" /scripts/export-ton.sh
+  '
+docker stop mytonctrl
+docker rm mytonctrl
+docker run -d --name mytonctrl --pull never --network host \
+  --restart unless-stopped --stop-timeout 75 --env-file .env \
+  --mount "type=volume,src=$TON_ARTIFACTS_VOLUME,dst=/ton-artifacts,readonly" \
+  --mount "type=volume,src=$TON_WORK_VOLUME,dst=/var/ton-work" \
+  "$MYTONCTRL_IMAGE"
+```
+
+Keep the same volume names and installation paths. The recreated container
+reuses the node database, keys, wallets and settings; interrupted initialization
+resumes with its existing dump cache. It also adopts the currently exported
+TON release. There is no need to export TON again for a controller-only update.
+
+#### Remove the standalone setup
+
+**Removing the volumes permanently deletes node keys, wallets, blockchain
+data, controller settings and downloaded dumps. Save any required backup
+outside these volumes first.**
+
+Remove this setup's container and its three volumes:
+
+```sh
+docker stop mytonctrl
+docker rm mytonctrl
+docker volume rm "$TON_WORK_VOLUME" "$TON_ARTIFACTS_VOLUME" "$TON_SCRIPTS_VOLUME"
+```
+
+The helper containers were removed automatically after exporting. To retain
+the node data, stop after removing the controller container and keep the
+volumes. Optionally, remove the downloaded images when other containers no
+longer use them and delete the local environment file:
+
+```sh
+docker image rm "$MYTONCTRL_IMAGE" "$TON_IMAGE"
+rm -f .env
+```
 
 ### Recover interrupted initialization
 
