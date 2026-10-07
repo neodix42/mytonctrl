@@ -120,6 +120,8 @@ printf 'Installed .env and compose.yml in %s\n' "$PWD"
 printf 'Controller image: %s\n' "$image"
 cat <<'EOF'
 
+Leave TON_WORK_HOST_DIR blank to use the standard TON_WORK_VOLUME Docker volume.
+For an external data disk, mount it and set TON_WORK_HOST_DIR to an absolute directory on it.
 Edit .env to choose installation arguments and images, then run:
   docker compose pull
   docker compose up -d --no-build --pull never

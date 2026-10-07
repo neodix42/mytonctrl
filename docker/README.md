@@ -30,8 +30,11 @@ TON runtime, with runtime libraries and diagnostic tools only.
 ## Start with Compose
 
 Use the [quick setup installer](../README.docker.md#quick-setup) in an empty deployment
-directory. It creates `.env` and `compose.yml` for published images. After
-editing `.env`, start the setup:
+directory. It creates `.env` and `compose.yml` for published images. Leave
+`TON_WORK_HOST_DIR` blank for the standard `TON_WORK_VOLUME` Docker volume, or
+set it to an absolute directory on your mounted data disk;
+see [storage setup and migration](../README.docker.md#store-ton-data-on-a-separate-disk).
+After editing `.env`, start the setup:
 
 ```sh
 # Edit .env: choose installation options in MYTONCTRL_ARGS.
@@ -65,21 +68,23 @@ add `-i` to `MYTONCTRL_ARGS` to bypass it for testing.
 `ton-binaries` exits after publishing; MyTonCtrl supervises the node and controller
 services without systemd, privileged mode or a Docker socket. All node state,
 keys, wallets, controller databases, network configurations and service settings
-live in the TON work volume. The entrypoint locks that volume to prevent two
-controllers from opening the same node state.
+live in the selected Docker volume or host directory mounted at `/var/ton-work`.
+The entrypoint locks that storage to prevent two controllers from opening the same node state.
 
 ## Start without Compose
 
 Prepare `.env` with the [quick setup installer](../README.docker.md#quick-setup), then
 use Docker directly. Replace the image tags below with your selected versions.
-The exporter comes from the controller image:
+Use the same `TON_WORK_VOLUME` and optional `TON_WORK_HOST_DIR` values in `.env`
+and your shell. The exporter comes from the controller image:
 
 ```sh
 docker pull ghcr.io/neodix42/mytonctrl:latest
 docker pull ghcr.io/ton-blockchain/ton:latest
 docker volume create mytonctrl-ton-scripts
 docker volume create mytonctrl-ton-artifacts
-docker volume create mytonctrl-ton-work
+TON_WORK_VOLUME=mytonctrl-ton-work
+TON_WORK_HOST_DIR=
 docker run --rm --entrypoint /bin/sh \
   --mount type=volume,src=mytonctrl-ton-scripts,dst=/scripts \
   ghcr.io/neodix42/mytonctrl:latest \
@@ -92,7 +97,7 @@ docker run --rm --entrypoint /bin/sh \
 docker run -d --name mytonctrl --network host --stop-timeout 75 \
   --env-file .env \
   --mount type=volume,src=mytonctrl-ton-artifacts,dst=/ton-artifacts,readonly \
-  --mount type=volume,src=mytonctrl-ton-work,dst=/var/ton-work \
+  -v "${TON_WORK_HOST_DIR:-$TON_WORK_VOLUME}:/var/ton-work" \
   ghcr.io/neodix42/mytonctrl:latest
 docker exec -it mytonctrl mytonctrl
 ```
@@ -108,7 +113,8 @@ docker run --rm \
 ## Use an existing TON container's volumes
 
 The controller also accepts the official image's native directories, without
-an export script or metadata. For example, start a binary-provider container:
+an export script or metadata. Use the same storage settings as in `.env`;
+blank `TON_WORK_HOST_DIR` uses `TON_WORK_VOLUME`. For example, start a binary-provider container:
 
 ```sh
 docker run -d --name ton-provider --entrypoint /bin/sleep \
@@ -120,7 +126,7 @@ docker run -d --name mytonctrl --network host --stop-timeout 75 --env-file .env 
   -v ton-native-bin:/ton-source/bin:ro \
   -v ton-native-fift:/ton-source/fift:ro \
   -v ton-native-smartcont:/ton-source/smartcont:ro \
-  -v mytonctrl-ton-work:/var/ton-work \
+  -v "${TON_WORK_HOST_DIR:-${TON_WORK_VOLUME:-mytonctrl-ton-work}}:/var/ton-work" \
   ghcr.io/neodix42/mytonctrl:latest
 ```
 
@@ -213,6 +219,16 @@ with shell-style quoting for values containing spaces. See the
 [host installation option table](../README.md#installation-options) for the
 original flags and [Docker arguments](../README.docker.md#installation-arguments-in-env)
 for their container behavior.
+
+`TON_WORK_HOST_DIR` is an optional absolute host storage path, independent of
+the installer work path (`-W`). Empty or unset selects the original named Docker
+volume, `TON_WORK_VOLUME` (default `mytonctrl-ton-work`). A nonempty path selects
+a bind mount at `/var/ton-work`. Mount your data disk and prepare its directory
+before startup; Compose's short mount syntax can create a missing directory.
+Image upgrades reuse the selected storage. `docker compose down -v` deletes
+named-volume node data, while host directory contents remain intact.
+See [storage setup and migration](../README.docker.md#store-ton-data-on-a-separate-disk)
+to move an existing named-volume installation without losing data.
 
 The default installs a mainnet validator using a prepared dump:
 

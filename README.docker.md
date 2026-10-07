@@ -4,7 +4,8 @@ MyTonCtrl and TON use separate images. The official TON image supplies binaries
 and Fift resources to a shared volume, with its `init.sh` entrypoint bypassed.
 The MyTonCtrl image initializes and runs the node using those mounted artifacts.
 It requires the artifacts to be mounted before startup. Node state, keys,
-wallets and controller settings persist in a separate work volume.
+wallets, downloaded dumps and controller settings persist in a standard Docker
+volume or an optional host data directory, mounted at `/var/ton-work` inside the container.
 
 Use the Compose quick setup below, or follow
 [the examples without Docker Compose](#use-docker-without-compose).
@@ -29,7 +30,8 @@ wget -qO- https://raw.githubusercontent.com/neodiX42/mytonctrl/master/install.sh
 The installer downloads only `.env` and `compose.yml` into the current
 directory. It refuses existing environment or Compose files.
 It prepares the setup without installing Docker or starting containers. Edit
-`.env`, then [start the containers and open the console](#start-and-open-the-console).
+`.env`, choose the [data storage](#store-ton-data-on-a-separate-disk),
+then [start the containers and open the console](#start-and-open-the-console).
 
 The default `--branch master` selects master assets and
 `ghcr.io/neodix42/mytonctrl:latest`. For dev assets and the `dev` image, use:
@@ -44,9 +46,87 @@ the selected branch; startup requires its image tag to have been published by
 GitHub Actions.
 
 The commands below use the downloaded `compose.yml`. Keep the same `.env`
-volume names and Compose project name throughout the setup's lifetime. Compose
-uses host networking for Linux nodes. See [Docker setup](docker/README.md) for
+volume names, optional host data directory and Compose project name throughout
+the setup's lifetime. Compose uses host networking for Linux nodes. See
+[Docker setup](docker/README.md) for
 standalone Docker commands, existing TON mounts and runtime details.
+
+## Store TON data on a separate disk
+
+Both Compose files use the original Docker-managed named volume when
+`TON_WORK_HOST_DIR` is empty or unset. Existing installations keep using the
+same volume, including custom names selected by `TON_WORK_VOLUME`:
+
+```dotenv
+TON_WORK_VOLUME=mytonctrl-ton-work
+TON_WORK_HOST_DIR=
+```
+
+To place the node database, keys, wallets, controller state, logs and dump cache
+on a separate disk, set `TON_WORK_HOST_DIR` to an absolute directory on the Docker
+host. For example, after mounting your data disk at `/mnt/ton`:
+
+```sh
+findmnt --mountpoint /mnt/ton &&
+  sudo mkdir -p /mnt/ton/ton-work
+df -h /mnt/ton/ton-work
+```
+
+Set this in `.env`:
+
+```dotenv
+TON_WORK_HOST_DIR=/mnt/ton/ton-work
+```
+
+Compose bind-mounts that directory at `/var/ton-work`; keep `-W` and
+`DUMP_CACHE_DIR` as container paths. With a nonempty host path, `TON_WORK_VOLUME`
+is unused and the small script and binary artifact volumes remain Docker-managed.
+Compose's short mount syntax creates a missing host directory automatically,
+so prepare it explicitly and verify the storage device before starting. See Docker's
+[bind mount options](https://docs.docker.com/reference/compose-file/services/#volumes).
+
+Mount the disk before starting the container, including after a host reboot.
+Check that `df` shows the intended data filesystem. Directory existence does
+not establish that the intended disk is mounted. Use a dedicated child directory
+on that disk and keep the same path during image upgrades and recovery.
+
+### Move an existing named-volume installation
+
+Changing the mount does not move existing data. With the old Compose setup,
+stop the controller first; this also stops its validator and background service:
+
+```sh
+docker compose stop mytonctrl
+```
+
+Prepare an empty directory on the mounted data disk as above. Copy the old
+volume while the node is stopped, using its actual volume name and an already
+available controller image:
+
+```sh
+OLD_TON_WORK_VOLUME=mytonctrl-ton-work
+TON_WORK_HOST_DIR=/mnt/ton/ton-work
+MYTONCTRL_IMAGE=ghcr.io/neodix42/mytonctrl:latest
+
+docker volume inspect "$OLD_TON_WORK_VOLUME" >/dev/null &&
+  docker run --rm --pull never --network none --user 0 --entrypoint /bin/sh \
+    --mount "type=volume,src=$OLD_TON_WORK_VOLUME,dst=/old,readonly" \
+    --mount "type=bind,src=$TON_WORK_HOST_DIR,dst=/new" \
+    "$MYTONCTRL_IMAGE" -eu -c 'test -z "$(ls -A /new)"; cp -a /old/. /new/'
+```
+
+This copies the database, keys, configuration and cached dumps with ownership
+and permissions preserved. The destination must be empty. Install the updated
+Compose file, set `TON_WORK_HOST_DIR` in `.env` to the destination, and
+keep the other image, port and installer settings. Then start the setup:
+
+```sh
+docker compose up -d --no-build --pull never
+docker compose exec mytonctrl mytonctrl --cmd status
+```
+
+Keep the old volume until you have verified the copied installation and backup.
+Do not run the old and new controllers against the same data concurrently.
 
 ## Installation arguments in .env
 
@@ -58,6 +138,7 @@ validator using a prepared dump:
 ```dotenv
 TON_IMAGE=ghcr.io/ton-blockchain/ton:latest
 MYTONCTRL_IMAGE=ghcr.io/neodix42/mytonctrl:latest
+TON_WORK_HOST_DIR=
 MYTONCTRL_ARGS=-m validator -n mainnet -d
 PUBLIC_IP=
 ```
@@ -190,8 +271,10 @@ images only. On the first setup in a checkout, create its `.env`:
 cp .env.example .env
 ```
 
-Keep `MYTONCTRL_IMAGE=mytonctrl:local` or choose another local image tag, then
-run these commands from that checkout's root:
+Leave `TON_WORK_HOST_DIR` blank for the named volume, or select a host directory
+as described in [storage setup](#store-ton-data-on-a-separate-disk). Keep
+`MYTONCTRL_IMAGE=mytonctrl:local` or choose another local image tag, then run
+these commands from that checkout's root:
 
 ```sh
 docker compose -f compose.yaml pull ton-binaries
@@ -304,17 +387,28 @@ MYTONCTRL_IMAGE=ghcr.io/neodix42/mytonctrl:latest
 TON_SCRIPTS_VOLUME=mytonctrl-ton-scripts
 TON_ARTIFACTS_VOLUME=mytonctrl-ton-artifacts
 TON_WORK_VOLUME=mytonctrl-ton-work
+TON_WORK_HOST_DIR=
 
 docker pull "$MYTONCTRL_IMAGE"
 docker pull "$TON_IMAGE"
 docker volume create "$TON_SCRIPTS_VOLUME"
 docker volume create "$TON_ARTIFACTS_VOLUME"
-docker volume create "$TON_WORK_VOLUME"
+if [ -n "$TON_WORK_HOST_DIR" ]; then
+  TON_WORK_MOUNT="type=bind,src=$TON_WORK_HOST_DIR,dst=/var/ton-work"
+else
+  docker volume create "$TON_WORK_VOLUME"
+  TON_WORK_MOUNT="type=volume,src=$TON_WORK_VOLUME,dst=/var/ton-work"
+fi
 ```
 
+The default uses a named volume. For a host directory, set `TON_WORK_HOST_DIR`
+in both your shell and `.env`, prepare it on your mounted disk as described in
+[storage setup](#store-ton-data-on-a-separate-disk), then run the mount-selection
+block above. Keep `TON_WORK_MOUNT` available for startup and image upgrades.
+
 Docker's [`--env-file`](https://docs.docker.com/reference/cli/docker/container/run/#env)
-passes settings to the container; it does not choose the image or volume names
-in these shell commands. Keep `MYTONCTRL_ARGS` unquoted as in `.env.example`,
+passes settings to the container; it does not choose the image, volume names or
+host path in these shell commands. Keep `MYTONCTRL_ARGS` unquoted as in `.env.example`,
 and use literal values rather than `${VARIABLE}` substitutions in `.env`.
 
 Copy the exporter bundled in the controller image into the script volume:
@@ -342,15 +436,16 @@ docker run --rm --pull never --network none --entrypoint /bin/sh \
   "$TON_IMAGE" /scripts/export-ton.sh
 ```
 
-Start the controller with the artifact volume read-only and the work volume
-persistent. These examples use the default work path `/var/ton-work`; if you
-select a different path with `-W`, mount the work volume at that path instead.
+Start the controller with the artifact volume read-only and your selected data
+storage mounted read-write. These examples use the default container work
+path `/var/ton-work`; if you select a different path with `-W`, change the work
+mount destination to that container path.
 
 ```sh
 docker run -d --name mytonctrl --pull never --network host \
   --restart unless-stopped --stop-timeout 75 --env-file .env \
   --mount "type=volume,src=$TON_ARTIFACTS_VOLUME,dst=/ton-artifacts,readonly" \
-  --mount "type=volume,src=$TON_WORK_VOLUME,dst=/var/ton-work" \
+  --mount "$TON_WORK_MOUNT" \
   "$MYTONCTRL_IMAGE"
 docker logs -f mytonctrl
 ```
@@ -421,32 +516,34 @@ docker rm mytonctrl
 docker run -d --name mytonctrl --pull never --network host \
   --restart unless-stopped --stop-timeout 75 --env-file .env \
   --mount "type=volume,src=$TON_ARTIFACTS_VOLUME,dst=/ton-artifacts,readonly" \
-  --mount "type=volume,src=$TON_WORK_VOLUME,dst=/var/ton-work" \
+  --mount "$TON_WORK_MOUNT" \
   "$MYTONCTRL_IMAGE"
 ```
 
-Keep the same volume names and installation paths. The recreated container
-reuses the node database, keys, wallets and settings; interrupted initialization
+Keep the same volume names, optional host data directory and installation paths.
+The recreated container reuses the node database, keys, wallets and settings; interrupted initialization
 resumes with its existing dump cache. It also adopts the currently exported
 TON release. There is no need to export TON again for a controller-only update.
 
 ### Remove the standalone setup
 
-**Removing the volumes permanently deletes node keys, wallets, blockchain
-data, controller settings and downloaded dumps. Save any required backup
-outside these volumes first.**
+Remove this setup's container and its artifact/script volumes:
 
-Remove this setup's container and its three volumes:
+**In named-volume mode, these commands also delete node keys, wallets, blockchain
+data and dumps. Back them up first.** With a host path, its directory remains intact.
 
 ```sh
 docker stop mytonctrl
 docker rm mytonctrl
-docker volume rm "$TON_WORK_VOLUME" "$TON_ARTIFACTS_VOLUME" "$TON_SCRIPTS_VOLUME"
+docker volume rm "$TON_ARTIFACTS_VOLUME" "$TON_SCRIPTS_VOLUME"
+if [ -z "$TON_WORK_HOST_DIR" ]; then
+  docker volume rm "$TON_WORK_VOLUME"
+fi
 ```
 
-The helper containers were removed automatically after exporting. To retain
-the node data, stop after removing the controller container and keep the
-volumes. Optionally, remove the downloaded images when other containers no
+The helper containers were removed automatically after exporting. For complete
+host data removal, follow [data cleanup](#remove-the-docker-setup).
+Optionally, remove the downloaded images when other containers no
 longer use them and delete the local environment file:
 
 ```sh
@@ -457,11 +554,14 @@ rm -f .env
 ## Recover interrupted initialization
 
 Use a controller image containing the recovery fixes, then follow the image
-upgrade commands above with the same `TON_WORK_VOLUME` and installation paths.
+upgrade commands above with the same `TON_WORK_VOLUME` or `TON_WORK_HOST_DIR`
+and installation paths.
 The container resumes initialization automatically, including installations
 left by an older image with an empty `.initializing` marker. Keep the existing
-volumes and marker; `docker compose down -v` deletes the downloaded dump and
-node data.
+work storage and marker. **In named-volume mode, `docker compose down -v` deletes
+the downloaded dump and node data.** With a host directory, that command removes
+only the script/artifact volumes and retains node data. Use `docker compose down`
+without `-v` to retain all storage in either mode.
 
 The default `DUMP_CACHE_DIR=/var/ton-work/dump-cache` is inside the persistent
 work volume. Mount persistent storage there if you choose a cache outside the
@@ -636,13 +736,17 @@ Retain the work volume while diagnosing synchronization or engine failures.
 
 Remove this Compose setup's containers, named volumes and service images:
 
+**When `TON_WORK_HOST_DIR` is blank, this deletes the node data volume, including
+keys, wallets, blockchain data, controller settings and downloaded dumps. Save a
+backup outside these volumes first.** It also deletes the TON artifacts and
+packaged script volume. When `TON_WORK_HOST_DIR` is set, that external directory
+remains intact, including all node data.
+
 ```sh
 docker compose down --volumes --rmi all --remove-orphans
 ```
 
-**This deletes node keys, wallets, blockchain data, controller settings and
-exported TON artifacts. Save any required backup outside these volumes first.**
-The cleanup applies to the services and volumes in this Compose file; see the
+The cleanup applies to the services and named volumes in this Compose file; see
 [Compose down reference](https://docs.docker.com/reference/cli/docker/compose/down/)
 for flag details. To also remove the files downloaded by quick setup after
 teardown, run:
@@ -650,3 +754,13 @@ teardown, run:
 ```sh
 rm -f .env compose.yml install.sh
 ```
+
+To erase the node data too, first stop and remove the containers, save any
+required backup elsewhere, and verify the exact directory you selected. For the
+example path in this guide, permanently delete it with:
+
+```sh
+sudo rm -rf -- /mnt/ton/ton-work
+```
+
+Replace that example with your actual `TON_WORK_HOST_DIR` when it differs.
