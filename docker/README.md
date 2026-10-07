@@ -29,7 +29,7 @@ TON runtime, with runtime libraries and diagnostic tools only.
 
 ## Start with Compose
 
-Use the [quick setup installer](../README.md#quick-setup) in an empty deployment
+Use the [quick setup installer](../README.docker.md#quick-setup) in an empty deployment
 directory. It creates `.env` and `compose.yml` for published images. After
 editing `.env`, start the setup:
 
@@ -45,7 +45,7 @@ docker compose exec mytonctrl mytonctrl
 
 The selected controller image tag must have been published by GitHub Actions
 before it can be pulled. For a local build, use the checkout root's `compose.yaml`
-as described in [development setup](../README.md#build-from-a-local-checkout-optional).
+as described in [development setup](../README.docker.md#build-from-a-local-checkout-optional).
 For build metadata, set `MYTONCTRL_BUILD_COMMIT` and `MYTONCTRL_BUILD_VERSION` in
 the checkout's `.env`, or pass `--build-arg MYTONCTRL_COMMIT=...`
 and `--build-arg MYTONCTRL_VERSION=...` to `docker build`. Custom builds can also
@@ -70,7 +70,7 @@ controllers from opening the same node state.
 
 ## Start without Compose
 
-Prepare `.env` with the [quick setup installer](../README.md#quick-setup), then
+Prepare `.env` with the [quick setup installer](../README.docker.md#quick-setup), then
 use Docker directly. Replace the image tags below with your selected versions.
 The exporter comes from the controller image:
 
@@ -163,7 +163,7 @@ docker compose up -d --no-deps --no-build --pull never mytonctrl
 ```
 
 Local development builds use the checkout's `compose.yaml`; see
-[controller updates](../README.md#upgrade-the-mytonctrl-image).
+[controller updates](../README.docker.md#upgrade-the-mytonctrl-image).
 
 The helper refreshes the packaged exporter script for future TON exports.
 Persisted node and controller data are reused. Console `update` and `upgrade`
@@ -211,7 +211,7 @@ Compose reads `.env` and passes it to the controller. Standalone Docker uses
 evaluates the file. Put the original installation flags in `MYTONCTRL_ARGS`,
 with shell-style quoting for values containing spaces. See the
 [host installation option table](../README.md#installation-options) for the
-original flags and [Docker arguments](../README.md#installation-arguments-in-env)
+original flags and [Docker arguments](../README.docker.md#installation-arguments-in-env)
 for their container behavior.
 
 The default installs a mainnet validator using a prepared dump:
@@ -262,7 +262,7 @@ selected `-W` path instead.
 Interrupted initialization resumes automatically using persisted settings and
 checkpoints. Cached dumps, node keys and existing configuration are preserved;
 background tasks start after the controller's client settings are ready. See
-[recovery instructions](../README.md#recover-interrupted-initialization).
+[recovery instructions](../README.docker.md#recover-interrupted-initialization).
 
 All original console arguments work with `docker exec ... mytonctrl`. They can
 also be supplied through `.env`:
@@ -301,7 +301,7 @@ ValidatorConsole is configured. Full tracebacks remain in the persistent
 
 "Previous initialization was interrupted" is an error from older images.
 Select an image with the recovery fixes and use the normal
-[controller upgrade commands](../README.md#upgrade-the-mytonctrl-image) with the
+[controller upgrade commands](../README.docker.md#upgrade-the-mytonctrl-image) with the
 same work volume. The empty pending marker from those images is supported and
 initialization resumes without deleting the archive or node identity. Keep the
 marker and data volumes. A completed cached archive is verified and reused;
