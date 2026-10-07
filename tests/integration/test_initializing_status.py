@@ -71,6 +71,54 @@ def test_status_works_during_dump_before_validator_console_exists(cli, ton, init
     assert "Shardchain out of sync: n/a" in output
 
 
+def test_container_status_displays_image_references_without_commit_or_branch(
+    cli, initializing_node, monkeypatch,
+):
+    monkeypatch.setattr(general, "get_controller_image_ref", lambda: "ghcr.io/neodix42/mytonctrl:v1.2.3")
+    monkeypatch.setattr(general, "get_ton_image_ref", lambda: "ghcr.io/ton-blockchain/ton:v2026.10")
+    monkeypatch.setattr(general, "get_git_hash", lambda *args, **kwargs: pytest.fail("container read Git hash"))
+    monkeypatch.setattr(general, "get_git_branch", lambda *args, **kwargs: pytest.fail("container read Git branch"))
+    monkeypatch.setattr(general, "get_bin_git_hash", lambda *args, **kwargs: pytest.fail("container read binary hash"))
+
+    output = cli.execute("status fast", no_color=True)
+
+    assert "Version mytonctrl: ghcr.io/neodix42/mytonctrl:v1.2.3\n" in output
+    assert "Version validator: ghcr.io/ton-blockchain/ton:v2026.10\n" in output
+    assert "external image" not in output
+
+
+@pytest.mark.parametrize("masterchain,shardchain", [(60, 9000), (None, 9000), (60, None)])
+def test_container_block_sync_reports_seconds_and_blocks_with_correct_units(
+    cli, ton, initializing_node, monkeypatch, masterchain, shardchain,
+):
+    (initializing_node / "controller/initialized.json").write_text("{}")
+    with open(ton.local.db_path) as stream:
+        config = json.load(stream)
+    config["validatorConsole"] = {
+        "appPath": "/usr/bin/ton/validator-engine-console/validator-engine-console",
+        "privKeyPath": "/var/ton-work/keys/client",
+        "pubKeyPath": "/var/ton-work/keys/server.pub",
+        "addr": "127.0.0.1:30304",
+    }
+    with open(ton.local.db_path, "w") as stream:
+        json.dump(config, stream)
+    status = Dict({"is_working": False, "out_of_sync": 9000,
+                   "masterchain_out_of_sync": masterchain,
+                   "shardchain_out_of_sync": shardchain})
+    monkeypatch.setattr(ton, "GetValidatorStatus", lambda: status)
+    monkeypatch.setattr(ton, "in_initial_sync", lambda: True)
+
+    output = cli.execute("status fast", no_color=True)
+
+    assert "Syncing blocks" in output
+    assert "9000 s ago" not in output
+    assert "None" not in output
+    if masterchain is not None:
+        assert "masterchain is 60 sec behind" in output
+    if shardchain is not None:
+        assert "shardchain is 9000 blocks behind" in output
+
+
 def test_status_reports_failure_and_ready_marker_overrides_old_failure(cli, initializing_node):
     controller = initializing_node / "controller"
     (controller / "installer-progress.json").write_text(json.dumps({

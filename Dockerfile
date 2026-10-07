@@ -14,7 +14,8 @@ COPY mytonctrl/ mytonctrl/
 COPY mytoninstaller/ mytoninstaller/
 ARG MYTONCTRL_COMMIT=unknown
 ARG MYTONCTRL_VERSION=unknown
-RUN python3 -c 'import os; from pathlib import Path; Path("mytonctrl/_version.py").write_text("__commit__ = " + repr(os.environ["MYTONCTRL_COMMIT"]) + "\n__version__ = " + repr(os.environ["MYTONCTRL_VERSION"]) + "\n")' \
+ARG MYTONCTRL_IMAGE_REF=
+RUN python3 -c 'import os; from pathlib import Path; Path("mytonctrl/_version.py").write_text("__commit__ = " + repr(os.environ["MYTONCTRL_COMMIT"]) + "\n__version__ = " + repr(os.environ["MYTONCTRL_VERSION"]) + "\n__image_ref__ = " + repr(os.environ["MYTONCTRL_IMAGE_REF"]) + "\n")' \
     && python3 -m pip wheel --no-deps --wheel-dir /wheels .
 
 FROM ubuntu:22.04 AS benchmark

@@ -12,11 +12,17 @@ wallet/contract scripts in `/usr/share/ton/smartcont`. All three are required.
 The controller image packages `export-ton.sh`. Compose first runs `ton-exporter`
 using that same image to copy the script into a shared `ton-scripts` volume.
 `ton-binaries` mounts the script volume read-only and runs the script in the
-unchanged official image with `init.sh` bypassed. It publishes immutable releases
+unchanged official image with `init.sh` bypassed. It publishes immutable binaries
 to a shared artifact volume and atomically selects `current`. There are two
 images and three services; the exporter helper exits after copying the script.
 MyTonCtrl mounts that volume read-only, checks its contents and binary architecture,
 then copies one release to a private `/run/ton-active` snapshot before starting.
+The `status` command shows each image reference instead of a source commit and
+branch. TON's reference is copied into that snapshot, so publishing an updated
+TON image does not change the identity shown by a running controller. Re-exporting
+identical binaries under another tag updates the export metadata for the next
+controller start. Existing native mounts without export metadata show an unknown
+TON image reference.
 It refuses startup if artifacts are missing or their runtime dependencies cannot
 be loaded. The controller image uses Ubuntu 22.04, matching the current official
 TON runtime, with runtime libraries and diagnostic tools only.
@@ -42,7 +48,11 @@ before it can be pulled. For a local build, use the checkout root's `compose.yam
 as described in [development setup](../README.md#build-from-a-local-checkout-optional).
 For build metadata, set `MYTONCTRL_BUILD_COMMIT` and `MYTONCTRL_BUILD_VERSION` in
 the checkout's `.env`, or pass `--build-arg MYTONCTRL_COMMIT=...`
-and `--build-arg MYTONCTRL_VERSION=...` to `docker build`. No controller code or
+and `--build-arg MYTONCTRL_VERSION=...` to `docker build`. Custom builds can also
+pass `--build-arg MYTONCTRL_IMAGE_REF=repository/image:tag` for the status display.
+Published images include their complete reference, and local Compose builds use
+`MYTONCTRL_IMAGE`. This build identity takes precedence over runtime `.env` values.
+No controller code or
 Python environment is stored in a data volume.
 
 Compose uses host networking, intended for Linux TON nodes. Allow the selected
@@ -75,6 +85,7 @@ docker run --rm --entrypoint /bin/sh \
   ghcr.io/neodix42/mytonctrl:latest \
   -c 'cp /usr/local/lib/mytonctrl/export-ton.sh /scripts/export-ton.sh'
 docker run --rm --entrypoint /bin/sh \
+  -e TON_IMAGE_REF=ghcr.io/ton-blockchain/ton:latest \
   --mount type=volume,src=mytonctrl-ton-artifacts,dst=/ton-artifacts \
   --mount type=volume,src=mytonctrl-ton-scripts,dst=/scripts,readonly \
   ghcr.io/ton-blockchain/ton:latest /scripts/export-ton.sh

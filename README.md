@@ -296,6 +296,18 @@ docker compose exec mytonctrl mytonctrl
 docker compose exec mytonctrl mytonctrl --cmd "get modes"
 ```
 
+In Docker mode, status displays image references instead of Git commits:
+
+```text
+Version mytonctrl: ghcr.io/neodix42/mytonctrl:latest
+Version validator: ghcr.io/ton-blockchain/ton:latest
+```
+
+The controller reference is embedded when building the image. The TON reference
+comes from the exported release copied into the running container; exporting
+a newer release leaves this display unchanged until the controller restarts.
+Mounted binaries without exported image metadata display an unknown image.
+
 Console defaults can also be set in `.env` using `MYTONCTRL_CONFIG`,
 `MYTONCTRL_WALLETS` and `MYTONCTRL_CMD`. Use `-s` in `MYTONCTRL_ARGS` for the startup
 check default. Explicit console arguments take precedence for options with values.
@@ -361,6 +373,10 @@ docker compose -f compose.yaml pull ton-binaries
 docker compose -f compose.yaml build mytonctrl
 docker compose -f compose.yaml up -d --no-build --pull never
 ```
+
+Compose embeds `MYTONCTRL_IMAGE` as the controller image reference. For a direct
+`docker build`, pass `--build-arg MYTONCTRL_IMAGE_REF=mytonctrl:local` alongside
+`-t mytonctrl:local`, replacing both values with your chosen image name and tag.
 
 ### Stop and resume
 
@@ -661,6 +677,66 @@ docker compose exec mytonctrl systemctl show validator --property=SubState,ExecM
 Installer failures and their full tracebacks are saved in
 `/var/ton-work/controller/mytoninstaller.log`. Keep the data volumes while
 diagnosing a failed start; retries reuse the extracted database.
+
+### Diagnose a node that is not catching up
+
+`Initialization status: ready` means installation and client configuration are
+complete. Blockchain synchronization continues afterward. Docker status shows
+masterchain lag in seconds and shardchain lag in blocks separately; compare
+both over time rather than treating the shard block gap as elapsed seconds.
+
+Inspect the engine's own log and process state when it restarts:
+
+```sh
+docker compose exec mytonctrl tail -n 160 /var/ton-work/log
+docker compose exec mytonctrl systemctl show validator --property=SubState,MainPID,ExecMainStatus
+docker compose logs --since 30m --tail 300 mytonctrl
+```
+
+For raw progress counters, run this twice about a minute apart. It reads the
+saved console settings, including the actual configured port:
+
+```sh
+docker compose exec mytonctrl /opt/mytonctrl/venv/bin/python -c '
+import json
+import subprocess
+from pathlib import Path
+
+config = json.loads(Path("/var/ton-work/controller/mytoncore/mytoncore.db").read_text())["validatorConsole"]
+subprocess.run([
+    config["appPath"], "-k", config["privKeyPath"], "-p", config["pubKeyPath"],
+    "-a", config["addr"], "-v", "0", "--cmd", "getstats",
+], check=True, timeout=15)
+'
+```
+
+Compare `masterchainblock`, `masterchainblocktime` and
+`shardclientmasterchainseqno`; increasing block numbers establish progress.
+A changing `start_time` indicates validator restarts. State serialization
+counters describe a separate background task.
+
+Check the saved network addresses and current I/O activity:
+
+```sh
+docker compose exec mytonctrl jq '{addrs,fullnode,fullnodeslaves}' /var/ton-work/db/config.json
+docker compose exec mytonctrl iostat -xz 1 5
+docker compose exec mytonctrl vmstat 1 5
+```
+
+Verify the advertised IP and ports in this saved configuration, since changing
+installation options in `.env` does not rewrite an initialized node. High disk
+activity can delay catch-up; inspect I/O latency and queue sizes. Allocated swap
+alone does not show active swapping; check `vmstat`'s `si` and `so` columns.
+
+During initial sync, controller queries can use public liteservers. A public
+server's latest block or zerostate banner describes that query, rather than
+the local node's progress. Failed queries now report their exit code instead
+of treating those banners as valid configuration data. Custom overlay messages
+also need to be evaluated separately from the validator engine's own failure.
+
+For a setup without Compose, replace `docker compose exec mytonctrl` with
+`docker exec mytonctrl`, and use `docker logs --since 30m --tail 300 mytonctrl`.
+Retain the work volume while diagnosing synchronization or engine failures.
 
 ### Remove the Docker setup
 

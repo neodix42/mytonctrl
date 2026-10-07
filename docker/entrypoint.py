@@ -155,6 +155,11 @@ def snapshot_artifacts(sources, target=Path("/run/ton-active")):
         shutil.rmtree(target)
     for source, name in zip(sources, ("bin", "fift", "smartcont")):
         shutil.copytree(source, target / name)
+    # Keep the reported image tied to these binaries, even after another export.
+    if sources and all(source.parent == sources[0].parent for source in sources):
+        metadata = sources[0].parent / "image-ref"
+        if metadata.is_file():
+            shutil.copyfile(metadata, target / "image-ref")
     validate_artifacts(target / "bin", target / "fift", target / "smartcont")
     for path in target.rglob("*"):
         path.chmod(path.stat().st_mode & ~0o222)

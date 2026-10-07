@@ -47,12 +47,17 @@ class EntrypointTests(unittest.TestCase):
 
     def test_snapshot_keeps_binaries_and_resources_when_provider_updates(self):
         sources = self.artifacts(self.root / "provider")
+        metadata = sources[0].parent / "image-ref"
+        metadata.write_text("ghcr.io/ton-blockchain/ton:running\n")
         active = entrypoint.snapshot_artifacts(sources, self.root / "active")
         (sources[0] / "validator-engine").write_text("new executable")
         (sources[1] / "TonUtil.fif").write_text("new library")
+        metadata.write_text("ghcr.io/ton-blockchain/ton:new\n")
         self.assertEqual((active / "bin/validator-engine").read_text(), "original executable")
         self.assertEqual((active / "fift/TonUtil.fif").read_text(), "original library")
         self.assertEqual((active / "bin/validator-engine").stat().st_mode & 0o222, 0)
+        self.assertEqual((active / "image-ref").read_text(), "ghcr.io/ton-blockchain/ton:running\n")
+        self.assertEqual((active / "image-ref").stat().st_mode & 0o222, 0)
 
     def test_existing_native_mounts_need_no_export_metadata(self):
         sources = self.artifacts(self.root / "native")
@@ -60,6 +65,8 @@ class EntrypointTests(unittest.TestCase):
         env["TON_ARTIFACTS_DIR"] = str(self.root / "absent")
         with patch.object(entrypoint, "mounted", return_value=True):
             self.assertEqual(entrypoint.artifact_sources(env), sources)
+        active = entrypoint.snapshot_artifacts(sources, self.root / "active")
+        self.assertFalse((active / "image-ref").exists())
 
     def test_missing_mount_fails_before_creating_runtime_or_state(self):
         with self.assertRaisesRegex(ValueError, "Missing TON artifact mount"):

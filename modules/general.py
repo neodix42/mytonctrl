@@ -30,6 +30,7 @@ from mytonctrl.git import (
     get_git_hash,
     get_git_branch,
 )
+from mytonctrl.images import get_controller_image_ref, get_ton_image_ref
 from mytoninstaller.archive_blocks import download_blocks
 from mytoninstaller.utils import get_ton_storage_port
 
@@ -912,13 +913,20 @@ class GeneralModule(MtcModule):
             ).format(validator_status["process.initial_sync"])
             print(validator_initial_sync_text)
         elif (
-            self.ton.in_initial_sync() and isinstance(validator_status.out_of_sync, (int, float))
+            self.ton.in_initial_sync()
+            and (
+                isinstance(validator_status.masterchain_out_of_sync, (int, float))
+                or isinstance(validator_status.shardchain_out_of_sync, (int, float))
+            )
         ):  # states have been downloaded, now downloading blocks
+            sync_details = []
+            if isinstance(validator_status.masterchain_out_of_sync, (int, float)):
+                sync_details.append(f"masterchain is {validator_status.masterchain_out_of_sync} sec behind")
+            if isinstance(validator_status.shardchain_out_of_sync, (int, float)):
+                sync_details.append(f"shardchain is {validator_status.shardchain_out_of_sync} blocks behind")
             validator_initial_sync_text = self.local.translate(
                 "local_status_validator_initial_sync"
-            ).format(
-                f"Syncing blocks, last known block was {validator_status.out_of_sync} s ago"
-            )
+            ).format("Syncing blocks, " + ", ".join(sync_details))
             print(validator_initial_sync_text)
         else:
             validator_out_of_sync_text = self.local.translate(
@@ -1006,43 +1014,10 @@ class GeneralModule(MtcModule):
         )
         print(db_status_text)
 
-        mtc_git_path = paths.mtc_src
-        try:
-            if is_container():
-                from mytonctrl import __commit__, __version__
-
-                mtc_git_hash = __commit__
-                mtc_git_branch = __version__
-            else:
-                fix_git_config(mtc_git_path)
-                mtc_git_hash = get_git_hash(mtc_git_path, short=True)
-                mtc_git_branch = get_git_branch(mtc_git_path)
-            mtc_git_hash_text = bcolors.yellow_text(mtc_git_hash)
-            mtc_git_branch_text = bcolors.yellow_text(mtc_git_branch)
-            mtc_version_text = self.local.translate("local_status_version_mtc").format(
-                mtc_git_hash_text, mtc_git_branch_text
-            )
-            print(mtc_version_text)
-        except Exception:
-            pass
-
-        validator_git_path = paths.ton_src
-        try:
-            validator_bin_git_path = paths.ton_bin / "validator-engine" / "validator-engine"
-            if is_container():
-                validator_git_branch = "external image"
-            else:
-                fix_git_config(validator_git_path)
-                validator_git_branch = get_git_branch(validator_git_path)
-            validator_git_hash = get_bin_git_hash(validator_bin_git_path, short=True)
-            validator_git_hash_text = bcolors.yellow_text(validator_git_hash)
-            validator_git_branch_text = bcolors.yellow_text(validator_git_branch)
-            validator_version_text = self.local.translate(
-                "local_status_version_validator"
-            ).format(validator_git_hash_text, validator_git_branch_text)
-            print(validator_version_text)
-        except Exception:
-            pass
+        mtc_image = bcolors.yellow_text(get_controller_image_ref())
+        validator_image = bcolors.yellow_text(get_ton_image_ref())
+        print(self.local.translate("local_status_image_mtc").format(mtc_image))
+        print(self.local.translate("local_status_image_validator").format(validator_image))
 
         print()
 
