@@ -146,6 +146,10 @@ PUBLIC_IP=
 Leave `PUBLIC_IP` blank to autodetect the public IPv4 address, or set the address
 the node should advertise. The entrypoint validates it before initialization.
 Choose and pin image tags or digests in `TON_IMAGE` and `MYTONCTRL_IMAGE`.
+Before installation or a TON upgrade, check the latest available release tag in
+the [official TON container package](https://github.com/ton-blockchain/ton/pkgs/container/ton)
+and set `TON_IMAGE` to the tag for your architecture. These examples use
+`v2026.08-amd64` for x86-64 hosts.
 
 Installation arguments apply when initializing an empty work volume. Existing
 installations keep their configuration; use console commands for later changes.
@@ -473,7 +477,9 @@ upgrade commands below to load a changed image or `.env` file.
 ### Upgrade TON independently
 
 Set `TON_IMAGE` to the desired tag or digest in `.env` and in your shell, then
-pull and export it. For example, to refresh the `latest` tag:
+pull and export it. Check the available tags in the
+[official TON container package](https://github.com/ton-blockchain/ton/pkgs/container/ton)
+and replace the example release below with your selected tag:
 
 ```sh
 TON_IMAGE=ghcr.io/ton-blockchain/ton:latest

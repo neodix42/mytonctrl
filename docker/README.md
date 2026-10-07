@@ -75,6 +75,9 @@ The entrypoint locks that storage to prevent two controllers from opening the sa
 
 Prepare `.env` with the [quick setup installer](../README.docker.md#quick-setup), then
 use Docker directly. Replace the image tags below with your selected versions.
+Check the latest available TON release tag in the
+[official TON container package](https://github.com/ton-blockchain/ton/pkgs/container/ton)
+and choose the tag for your host architecture; the examples use x86-64 (`amd64`).
 Use the same `TON_WORK_VOLUME` and optional `TON_WORK_HOST_DIR` values in `.env`
 and your shell. The exporter comes from the controller image:
 
@@ -102,7 +105,7 @@ docker run -d --name mytonctrl --network host --stop-timeout 75 \
 docker exec -it mytonctrl mytonctrl
 ```
 
-Check mounts and binary dependencies without initializing node state:
+Check mounts and binary dependencies without initializing the node state:
 
 ```sh
 docker run --rm \
