@@ -9,6 +9,8 @@ volume or an optional host data directory, mounted at `/var/ton-work` inside the
 
 Use the Compose quick setup below, or follow
 [the examples without Docker Compose](#use-docker-without-compose).
+For an existing `ton-docker-ctrl` installation, follow
+[the migration wizard](#migrate-from-ton-docker-ctrl) before starting this image.
 
 ## Quick setup
 
@@ -127,6 +129,96 @@ docker compose exec mytonctrl mytonctrl --cmd status
 
 Keep the old volume until you have verified the copied installation and backup.
 Do not run the old and new controllers against the same data concurrently.
+
+## Migrate from ton-docker-ctrl
+
+Use the interactive wizard to migrate an existing
+[`ton-blockchain/ton-docker-ctrl`](https://github.com/ton-blockchain/ton-docker-ctrl)
+installation on the **same Linux host**. Install Python 3.8 or newer and Docker
+Compose, then run this from a terminal on that host:
+
+```sh
+wget -O migrate.sh https://raw.githubusercontent.com/neodiX42/mytonctrl/master/migrate.sh
+sudo bash migrate.sh
+```
+
+For the dev version, download from `dev` and run `sudo bash migrate.sh --branch dev`.
+Use `bash migrate.sh --help` for options. Download the script before running it;
+the wizard needs an interactive terminal for its questions and confirmations.
+
+Before proceeding, take an independent backup or storage snapshot. Prepare a
+mounted data disk with enough free space for a **complete additional copy** of
+the old node; archive databases can require many terabytes. The destination must
+be separate from all of the old installation's data directories. Keep the old
+container, image, volumes and deployment files until migration is verified.
+
+### What the wizard does
+
+The wizard identifies the old container and asks you to review its network,
+node mode, advertised IP, ports, retention settings and replacement images. It
+asks for a dedicated destination on your data disk, creates its deployment
+directory automatically, and requests confirmation before stopping the old
+node and before starting the replacement.
+
+It then:
+
+1. Disables the old container's
+   [automatic restart](https://docs.docker.com/engine/containers/start-containers-automatically/),
+   then stops its controller and validator before taking the copy.
+2. Copies the entire TON work directory, controller state, wallets, private keys,
+   console settings and network configuration into separate storage.
+3. Downloads this repository's `.env.example` and Compose file, configures the
+   new deployment, and imports the saved identities and controller settings.
+4. Checks the backup, configuration and copied key files, then starts the new
+   node after confirmation and prints status and rollback commands.
+
+The migration retains the blockchain database, archive history and cached
+downloads; it does **not** request another dump download. The original data
+stays intact and the old container remains stopped. Sources and build tools from
+the old image are replaced by prebuilt binaries and Fift resources from the
+separately selected `TON_IMAGE`.
+
+### Network and node mode
+
+Network selection is independent of node mode. Review the detected values;
+migration preserves the existing installation rather than converting its role
+or switching networks.
+
+| Existing installation | Migration behavior |
+| --- | --- |
+| Mainnet | Keeps the saved mainnet configuration and uses `-n mainnet`. |
+| Testnet | Keeps the saved testnet configuration and uses `-n testnet`. Select a compatible TON image; the old `TON_BRANCH=testnet` is not an image tag and does not carry over. |
+| Validator | Keeps its validator wallet, ADNL identity, election/staking settings and node keys. Never run both installations with these keys at the same time. |
+| Liteserver | Keeps its liteserver key, TCP port and retention settings so existing clients can continue using it. |
+| Archive node, on either network | Keeps the actual validator or liteserver mode, complete history, permanent storage and retention settings before the first start. It does not bootstrap a new archive. |
+
+Use a TON image compatible with the existing database first; upgrade TON
+separately after confirming migration. Check available releases in the
+[official TON package](https://github.com/ton-blockchain/ton/pkgs/container/ton).
+The new setup uses host networking. Allow the retained node UDP/QUIC and
+liteserver TCP ports through the host firewall; keep the console port private.
+Unusual layouts, multiple local console/liteserver endpoints, auxiliary services
+or different-host/IP moves need review before migration; the wizard stops when
+it cannot safely handle the detected configuration.
+Bounded archive imports using `--sync-shards-upto` also require a separate review.
+
+### Verify or roll back
+
+Use the commands printed by the wizard to inspect `status`, wallet and ADNL
+addresses, network, ports and logs. For archive nodes, also verify historical
+queries and retained archive files. Successful startup alone does not establish
+that all required data and identities have been preserved.
+
+On failure, the wizard stops the replacement and leaves the old node stopped.
+For rollback, stop the new deployment and confirm its validator has exited,
+then start the original container using its original data and image; follow the
+printed rollback script, which also restores the original restart policy.
+Never attach the old engine to the new database copy. Transactions broadcast
+after migration are not undone by rollback; reconcile validator elections,
+stake and wallet state before resuming the old controller.
+
+Do not use `docker compose down -v`, prune volumes or delete the old data during
+migration. The wizard never deletes the source installation automatically.
 
 ## Installation arguments in .env
 
