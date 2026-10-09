@@ -31,6 +31,9 @@ class MigrationError(Exception):
     pass
 
 
+STAKING_MODES = ('single-nominator', 'nominator-pool-v2', 'nominator-pool', 'liquid-staking')
+
+
 def run(args, capture=True, **kwargs):
     result = subprocess.run([str(arg) for arg in args], check=False,
                             text=True, capture_output=capture, **kwargs)
@@ -123,12 +126,17 @@ def infer_settings(core, node, service, legacy_env):
     modes = core.get('modes', {})
     if not isinstance(modes, dict):
         raise MigrationError('The donor uses an older mode schema; convert it with the legacy controller before migration.')
-    active = [name for name in ('validator', 'liteserver') if modes.get(name)]
+    staking = [name for name in STAKING_MODES if modes.get(name)]
+    if staking and 'validator' not in modes:
+        raise MigrationError('Saved validator mode is missing for this staking installation; resolve it with the legacy controller before migration.')
+    if modes.get('validator') and (modes.get('liteserver') or modes.get('collator')):
+        raise MigrationError('Conflicting validator/liteserver/collator modes; resolve them with the legacy controller before migration.')
+    active = staking + [name for name in ('validator', 'collator', 'liteserver') if modes.get(name)]
     mode = legacy_env.get('MODE')
-    if mode not in ('validator', 'liteserver') or mode not in active:
-        mode = next((name for name in ('validator', 'liteserver') if name in active), None)
+    if mode not in active or (mode == 'validator' and staking):
+        mode = next(iter(active), None)
     if mode is None:
-        raise MigrationError('Automatic migration supports existing validator and liteserver modes.')
+        raise MigrationError('No supported saved node or staking mode found; resolve the legacy controller modes before migration.')
     network = legacy_env.get('NETWORK', 'testnet' if legacy_env.get('TON_BRANCH') == 'testnet' else 'mainnet')
     settings = {'MODE': mode, 'NETWORK': network, 'PUBLIC_IP': str(address),
                 'VALIDATOR_PORT': str(udp[0]['port']),
@@ -321,6 +329,13 @@ def zero_state(config):
     return (state.get('root_hash'), state.get('file_hash'))
 
 
+def collator_whitelist(config):
+    # TON serializes a disabled, empty whitelist as null. Ignore that difference
+    # and entry ordering, while checking every permission and allowed ADNL ID.
+    whitelist = (config.get('extraconfig') or {}).get('collator_node_whitelist') or {}
+    return bool(whitelist.get('enabled', False)), sorted(whitelist.get('adnl_ids') or [])
+
+
 def migration_space_plan(probe, log_bytes=0, block_size=4096):
     """Budget every retained copy; sparse files and compression get no credit."""
     block_size = max(4096, block_size)
@@ -333,7 +348,7 @@ def migration_space_plan(probe, log_bytes=0, block_size=4096):
     console = {name: size for name, size in probe['sizes'].items() if name.startswith('mytonctrl/')}
     identity = {name: size for name, size in probe['sizes'].items()
                 if name.startswith(('mytoncore/', 'ton-work/keys/', 'ton-work/db/keyring/'))
-                or name in ('ton-work/db/config.json', 'ton-work/db/collators-list.json')}
+                or name in ('ton-work/db/config.json', 'ton-work/db/collators-list.json', 'ton-work/db/collator-options.json')}
     # Full legacy copies include virtual environments/cache excluded from the
     # identity inventory. Docker cp also copies those trees and normal log files.
     copied = sum(item['bytes'] + 2 * item['entries'] * block_size
@@ -665,7 +680,10 @@ class Wizard:
                              TON_WORK_HOST_DIR=str(self.root / 'ton-work'),
                              TON_ARTIFACTS_VOLUME=self.project + '-artifacts', TON_SCRIPTS_VOLUME=self.project + '-scripts',
                              TON_WORK_VOLUME=self.project + '-unused-work')
-        args = ['-m', self.settings['MODE'], '-n', self.settings['NETWORK'], '-p', '/migration/backup.tar.gz']
+        # Restoring an existing collator must not invoke SetupCollator, which
+        # creates another ADNL key/registration even when a backup is supplied.
+        install_mode = 'none' if self.settings['MODE'] == 'collator' else self.settings['MODE']
+        args = ['-m', install_mode, '-n', self.settings['NETWORK'], '-p', '/migration/backup.tar.gz']
         if probe['core'].get('sendTelemetry') is False:
             args.append('-t')
         self.settings['MYTONCTRL_ARGS'] = shlex.join(args)
@@ -675,6 +693,9 @@ class Wizard:
         print('\nMigration plan:')
         for key in ('NETWORK', 'MODE', 'PUBLIC_IP', 'VALIDATOR_PORT', 'QUIC_PORT', 'VALIDATOR_CONSOLE_PORT', 'LITESERVER_PORT', 'ARCHIVE_TTL', 'STATE_TTL', 'MYTONCTRL_IMAGE', 'TON_IMAGE'):
             print(f'  {key}={self.settings[key]}')
+        print('  Enabled controller modes: ' + ', '.join(name for name, enabled in probe['core']['modes'].items() if enabled))
+        if self.settings['MODE'] == 'collator':
+            print('  Existing collator identities and registrations will be restored without creating a new collator.')
         print('  Database/history, cached dumps, wallets, keys and controller settings will be copied.')
         print('  No dump/archive download. Original container, image and volumes remain available for rollback.')
         print('  New Compose uses host networking. Retain UDP/QUIC/liteserver firewall access; keep the console port private.')
@@ -903,9 +924,10 @@ class Wizard:
         (identity / 'db').mkdir()
         shutil.copy2(work / 'db/config.json', identity / 'db/config.json')
         shutil.copytree(work / 'db/keyring', identity / 'db/keyring')
-        collators = work / 'db/collators-list.json'
-        if collators.is_file():
-            shutil.copy2(collators, identity / 'db/collators-list.json')
+        for name in ('collators-list.json', 'collator-options.json'):
+            collators = work / 'db' / name
+            if collators.is_file():
+                shutil.copy2(collators, identity / 'db' / name)
 
     def check_ports(self):
         for protocol, names in ((socket.SOCK_STREAM, ('VALIDATOR_CONSOLE_PORT', 'LITESERVER_PORT')),
@@ -933,9 +955,13 @@ class Wizard:
         elif old_modes != new_modes:
             raise MigrationError('Saved node modes changed; destination stopped for review.')
         node = json.loads((self.root / 'ton-work/db/config.json').read_text())
-        for field in ('fullnode', 'control', 'liteservers', 'addrs'):
+        node_fields = {'fullnode', 'control', 'liteservers', 'addrs', 'collators'}
+        node_fields.update(field for field in set(node) | set(original['node']) if 'collator' in field.lower())
+        for field in sorted(node_fields):
             if node.get(field) != original['node'].get(field):
                 raise MigrationError(f'Node {field} changed; the destination was stopped for review.')
+        if collator_whitelist(node) != collator_whitelist(original['node']):
+            raise MigrationError('Collator whitelist changed; the destination was stopped for review.')
         command = json.loads(self.compose_run(['exec', '-T', 'mytonctrl', 'python3', '-c', '''
 import json
 from pathlib import Path

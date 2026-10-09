@@ -209,7 +209,21 @@ or switching networks.
 | Testnet | Keeps the saved testnet configuration and uses `-n testnet`. Select a compatible TON image; the old `TON_BRANCH=testnet` is not an image tag and does not carry over. |
 | Validator | Keeps its validator wallet, ADNL identity, election/staking settings and node keys. Never run both installations with these keys at the same time. |
 | Liteserver | Keeps its liteserver key, TCP port and retention settings so existing clients can continue using it. |
-| Archive node, on either network | Keeps the actual validator or liteserver mode, complete history, permanent storage and retention settings before the first start. It does not bootstrap a new archive. |
+| Collator | Keeps existing collator ADNL keys, registrations, validator whitelist, collation options and delegated collators. Restores the saved mode without creating another collator. |
+| Single-nominator | Keeps validator and single-nominator mode flags, wallets, pool files and staking settings. |
+| Nominator-pool v2 | Keeps the v2 pool files, addresses and staking settings. |
+| Nominator-pool v1 (deprecated) | Keeps the existing v1 pool and mode; migration does not convert it to v2. |
+| Liquid-staking | Keeps controller lists, liquid pool address, wallets and loan settings. |
+| Archive node, on either network | Keeps saved node and staking modes, complete history, permanent storage and retention settings before the first start. It does not bootstrap a new archive. |
+
+Saved mode flags take precedence over stale installation environment settings.
+An explicitly disabled validator remains disabled, including paused staking nodes.
+For collators, the generated `-m none -p ...` restores the backup without fresh
+collator setup; the restored controller still runs in its saved collator mode.
+Ambiguous legacy mode schemas and conflicting validator/liteserver/collator flags
+must be resolved using the old controller first. A separate `collator.service`
+is an additional service and requires its own migration; the supported collator
+mode runs inside `validator-engine`.
 
 Use a TON image compatible with the existing database first; upgrade TON
 separately after confirming migration. Check available releases in the

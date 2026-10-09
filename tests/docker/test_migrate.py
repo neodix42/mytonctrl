@@ -1,5 +1,6 @@
 """Check migration safeguards with disposable legacy data and fake Docker calls."""
 
+import ast
 import copy
 from contextlib import redirect_stderr, redirect_stdout
 import hashlib
@@ -72,6 +73,8 @@ CORE_CONFIG = {
     "modes": {"validator": True, "nominator-pool": True, "liteserver": False},
     "customPools": ["original-pool"],
 }
+
+STAKING_MODES = ("single-nominator", "nominator-pool-v2", "nominator-pool", "liquid-staking")
 
 
 class MigrationFixture(unittest.TestCase):
@@ -302,6 +305,7 @@ class MigrationFixture(unittest.TestCase):
         confirm.assert_not_called()
 
     def test_testnet_validator_ports_and_finite_retention_are_retained(self):
+        self.core["modes"] = {"validator": True, "liteserver": False}
         service = (
             "[Service]\nExecStart=/usr/bin/ton/validator-engine/validator-engine "
             "--threads 127 --global-config /usr/bin/ton/global.config.json "
@@ -349,6 +353,94 @@ class MigrationFixture(unittest.TestCase):
         with self.assertRaises(self.wizard.MigrationError):
             self.wizard.infer_settings(self.core, self.node,
                                        ["/usr/bin/ton/validator-engine/validator-engine"], {})
+
+    def test_saved_role_flags_take_precedence_over_missing_or_stale_environment_modes(self):
+        for role in ("liteserver", "collator", *STAKING_MODES):
+            core = copy.deepcopy(self.core)
+            core["modes"] = {"validator": role in STAKING_MODES, "liteserver": False, "collator": False, role: True}
+            before = copy.deepcopy(core)
+            for declared in (None, "validator", "unsupported-mode", role):
+                with self.subTest(role=role, declared=declared):
+                    env = {} if declared is None else {"MODE": declared}
+                    settings = self.wizard.infer_settings(core, self.node,
+                                                          ["/usr/bin/ton/validator-engine/validator-engine"], env)
+                    self.assertEqual(settings["MODE"], role)
+                    self.assertEqual(core, before, "Inferring a mode must not change saved controller settings")
+
+    def test_declared_active_staking_role_is_preserved_and_generic_validator_has_predictable_priority(self):
+        core = copy.deepcopy(self.core)
+        core["modes"] = {"validator": True, "liteserver": False, "collator": False,
+                         **{role: True for role in STAKING_MODES}}
+        command = ["/usr/bin/ton/validator-engine/validator-engine"]
+        for role in STAKING_MODES:
+            with self.subTest(declared=role):
+                self.assertEqual(self.wizard.infer_settings(core, self.node, command, {"MODE": role})["MODE"], role)
+        self.assertEqual(self.wizard.infer_settings(core, self.node, command, {"MODE": "validator"})["MODE"],
+                         "single-nominator")
+
+    def test_paused_staking_role_is_recognized_without_reenabling_validator(self):
+        for role in STAKING_MODES:
+            with self.subTest(role=role):
+                core = copy.deepcopy(self.core)
+                core["modes"] = {"validator": False, "liteserver": False, role: True}
+                before = copy.deepcopy(core)
+                settings = self.wizard.infer_settings(core, self.node,
+                                                      ["/usr/bin/ton/validator-engine/validator-engine"], {"MODE": "validator"})
+                self.assertEqual(settings["MODE"], role)
+                self.assertEqual(core, before)
+
+    def test_staking_role_with_missing_validator_flag_is_rejected_without_mutating_saved_settings(self):
+        for role in STAKING_MODES:
+            with self.subTest(role=role):
+                core = copy.deepcopy(self.core)
+                core["modes"] = {role: True}
+                before = copy.deepcopy(core)
+                with self.assertRaises(self.wizard.MigrationError):
+                    self.wizard.infer_settings(core, self.node, ["/usr/bin/ton/validator-engine/validator-engine"], {})
+                self.assertEqual(core, before)
+
+    def test_collator_or_liteserver_with_enabled_validator_requires_review(self):
+        for conflicting in ("collator", "liteserver"):
+            with self.subTest(conflicting=conflicting):
+                core = copy.deepcopy(self.core)
+                core["modes"] = {"validator": True, conflicting: True}
+                before = copy.deepcopy(core)
+                with self.assertRaises(self.wizard.MigrationError):
+                    self.wizard.infer_settings(core, self.node, ["/usr/bin/ton/validator-engine/validator-engine"],
+                                               {"MODE": conflicting})
+                self.assertEqual(core, before)
+
+    def test_actual_native_mode_functions_skip_new_events_for_migration_backup_arguments(self):
+        # Exercise the actual installer functions without requiring the native
+        # TON/Python dependency stack merely to test this event-dispatch guard.
+        path = MIGRATE_SCRIPT.parent / "mytoninstaller/settings.py"
+        source = ast.parse(path.read_text(), filename=str(path))
+        definitions = [node for node in source.body if isinstance(node, ast.FunctionDef)
+                       and node.name in ("EnableMode", "SetupCollator")]
+        self.assertEqual({node.name for node in definitions}, {"EnableMode", "SetupCollator"})
+        isolated = ast.Module(body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            *definitions,
+        ], type_ignores=[])
+        runner = mock.Mock()
+        module = {"sys": sys, "_run_as_installer_user": runner, "is_container": mock.Mock()}
+        exec(compile(ast.fix_missing_locations(isolated), str(path), "exec"), module)
+        local = types.SimpleNamespace(add_log=mock.Mock())
+        for container in (False, True):
+            with self.subTest(container=container):
+                module["is_container"].return_value = container
+                ctx = types.SimpleNamespace(user="root", mode="none", backup="/migration/backup.tar.gz")
+                module["EnableMode"](local, ctx)
+                module["SetupCollator"](local, ctx)
+                runner.assert_not_called()
+        # Native collator setup retains its original dispatch behavior. The
+        # wizard skips it by choosing mode=none when restoring an existing node.
+        module["is_container"].return_value = False
+        ctx = types.SimpleNamespace(user="native-user", mode="collator", backup="existing-backup.tar.gz")
+        module["EnableMode"](local, ctx)
+        runner.assert_not_called()
+        module["SetupCollator"](local, ctx)
+        runner.assert_called_once_with("native-user", [sys.executable, "-m", "mytoncore", "-e", "setup_collator"])
 
     def test_multiple_endpoints_require_review_instead_of_silently_rekeying(self):
         self.node["control"].append({"port": 40314, "id": "second-console-key"})
@@ -548,9 +640,14 @@ class MigrationFixture(unittest.TestCase):
         self.assertEqual(file_digests(self.donor), before)
 
     def exercise_wizard(self, fail_at=None, core_update=None, node_update=None, restart_policy=None,
-                        existing_env=None, env_consent="yes"):
+                        existing_env=None, env_consent="yes", legacy_env=None, extra_files=None,
+                        active_services="", runtime_core_update=None, runtime_node_update=None):
         """Run the real workflow, substituting only host tools and image processes."""
         self.create_legacy_data()
+        for name, contents in (extra_files or {}).items():
+            path = self.donor / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents if isinstance(contents, bytes) else contents.encode())
         latest_core = {**copy.deepcopy(self.core), **(core_update or {})}
         latest_node = {**copy.deepcopy(self.node), **(node_update or {})}
         (self.donor / "mytoncore/mytoncore.db").write_text(json.dumps(latest_core))
@@ -580,7 +677,8 @@ class MigrationFixture(unittest.TestCase):
                     "/usr/local/bin/mytonctrl": self.donor / "mytonctrl",
                     "/usr/bin/ton": self.donor / "ton-runtime"}
         inspected = {"Id": "donor-id", "State": {"Running": True},
-                     "Config": {"Env": ["NETWORK=mainnet"]}, "HostConfig": {},
+                     "Config": {"Env": [key + "=" + value for key, value in {"NETWORK": "mainnet", **(legacy_env or {})}.items()]},
+                     "HostConfig": {},
                      "GraphDriver": {"Name": "overlay2", "Data": {"UpperDir": str(self.root)}},
                      "Mounts": [{"Destination": name, "Source": str(source)}
                                 for name, source in mappings.items() if name != "/usr/bin/ton"]}
@@ -634,6 +732,13 @@ class MigrationFixture(unittest.TestCase):
                     state["pulled"] = True
                 if operation and operation[0] == "up":
                     (migration / "ton-work/controller/initialized.json").write_text("{}")
+                    for name, updates in (("controller/mytoncore/mytoncore.db", runtime_core_update),
+                                          ("db/config.json", runtime_node_update)):
+                        if updates:
+                            path = migration / "ton-work" / name
+                            data = json.loads(path.read_text())
+                            data.update(updates)
+                            path.write_text(json.dumps(data))
                 if operation[:4] == ["exec", "-T", "mytonctrl", "python3"]:
                     return json.dumps([command])
                 if operation[:5] == ["exec", "-T", "mytonctrl", "systemctl", "show"]:
@@ -653,6 +758,8 @@ class MigrationFixture(unittest.TestCase):
             if args[:4] == ["docker", "exec", "donor-id", "systemctl"]:
                 if args[-2:] == ["stop", "validator"]:
                     state["writer_running"] = False
+                if "list-units" in args:
+                    return active_services
                 return ""
             if args[:2] == ["docker", "stop"]:
                 state["container_running"] = False
@@ -709,12 +816,19 @@ class MigrationFixture(unittest.TestCase):
                 mock.patch.object(self.wizard, "run", side_effect=run), \
                 mock.patch.object(self.wizard.time, "sleep", side_effect=AssertionError("Unexpected service wait")), \
                 mock.patch.object(self.wizard.subprocess, "run", side_effect=logs), redirect_stdout(io.StringIO()):
-            if fail_at == "env-cancel":
+            if fail_at in ("env-cancel", "runtime"):
+                errors = io.StringIO()
+                host_open = open
+
+                def open_terminal(path, *args, **kwargs):
+                    return wizard.tty if str(path) == "/dev/tty" else host_open(path, *args, **kwargs)
+
                 with mock.patch.object(self.wizard, "Wizard", return_value=wizard), \
-                        mock.patch("builtins.open", return_value=wizard.tty), \
+                        mock.patch("builtins.open", side_effect=open_terminal), \
                         mock.patch.object(sys, "argv", ["migrate.sh"]), \
-                        mock.patch.object(self.wizard.signal, "signal"), redirect_stderr(io.StringIO()):
+                        mock.patch.object(self.wizard.signal, "signal"), redirect_stderr(errors):
                     self.assertEqual(self.wizard.main(), 1)
+                state["error"] = errors.getvalue()
             elif fail_at:
                 with self.assertRaises(self.wizard.MigrationError):
                     wizard.execute()
@@ -808,6 +922,181 @@ class MigrationFixture(unittest.TestCase):
         self.assertLess(first_copy, start)
         self.assertLess(image_probe, controller_stop)
         self.assertLess(image_probe, first_copy)
+
+    def test_all_requested_roles_migrate_without_losing_staking_files_wallets_or_mode_settings(self):
+        original_root, original_donor, original_core, original_node = self.root, self.donor, self.core, self.node
+        cases = [(role, False) for role in ("liteserver", "collator", *STAKING_MODES)]
+        cases.extend((role, True) for role in STAKING_MODES)
+        for role, paused in cases:
+            with self.subTest(role=role, paused=paused):
+                try:
+                    self.root = original_root / (role + ("-paused" if paused else ""))
+                    self.root.mkdir()
+                    self.donor = self.root / "donor"
+                    self.donor.mkdir()
+                    self.core = copy.deepcopy(CORE_CONFIG)
+                    modes = {name: False for name in ("validator", "liteserver", "collator", *STAKING_MODES)}
+                    modes.update({role: True, "validator": role in STAKING_MODES and not paused,
+                                  "alert-bot": True, "prometheus": False})
+                    retained = {
+                        "modes": modes, "validatorWalletName": "existing-wallet", "adnlAddr": "original-validator-adnl",
+                        "customPools": ["original-pool", "retained-staking-pool"],
+                        "stake": 45000, "stakePercent": 63, "maxFactor": 1.5,
+                        "liquid_pool_addr": "retained-liquid-pool-address", "min_loan": 42000,
+                        "max_loan": 47000, "max_interest_percent": 1.7,
+                        "user_controllers_list": ["user-controller"], "using_controllers": ["active-controller"],
+                        "old_controllers": ["old-controller"], "stop_controllers_list": ["stopped-controller"],
+                        "user_controllers": {"user-controller": {"stake": 41000}},
+                    }
+                    self.core.update(retained)
+                    self.node = copy.deepcopy(NODE_CONFIG)
+                    extra_files = {
+                        "mytoncore/pools/retained-pool.addr": b"\x80retained-pool-address\x00",
+                        "mytoncore/pools/retained-pool.boc": b"\xb5\xee\x9c\x72retained-pool-contract",
+                        "mytoncore/contracts/nominator-pool/func/new-pool.fif": b"retained-v1-contract-script",
+                        "mytoncore/contracts/nominator-pool-v2/pool-contract.boc": b"retained-v2-contract",
+                        "mytoncore/contracts/single-nominator-pool/single-nominator-code.hex": b"retained-single-contract",
+                        "mytoncore/contracts/jetton_pool/controller.fif": b"retained-liquid-controller-script",
+                        "mytoncore/wallets/pool-owner.pk": b"retained-pool-owner-private-key",
+                        "mytoncore/wallets/pool-owner.addr": b"retained-pool-owner-address",
+                    }
+                    if role == "collator":
+                        self.node.update({
+                            "adnl": [{"id": "original-collator-adnl", "category": 0}],
+                            "collators": ["original-collator-adnl"],
+                            "extraconfig": {"collator_node_whitelist": {"enabled": True,
+                                                                       "adnl_ids": ["retained-validator-adnl"]}},
+                        })
+                        extra_files.update({
+                            "ton-work/db/keyring/collator-key": b"original-collator-private-key",
+                            "ton-work/db/collators-list.json": json.dumps({"collators": [{"adnl_id": "retained-peer"}]}),
+                            "ton-work/db/collator-options.json": json.dumps({"max_collators": 7, "max_parallel_collations": 3}),
+                        })
+                    wizard, calls, state = self.exercise_wizard(legacy_env={"MODE": "validator"}, extra_files=extra_files)
+                    self.assertEqual(wizard.settings["MODE"], role)
+                    env = self.wizard.parse_env((wizard.root / "deployment/.env").read_text())
+                    arguments = shlex.split(env["MYTONCTRL_ARGS"])
+                    self.assertEqual(arguments[arguments.index("-m") + 1], "none" if role == "collator" else role)
+                    self.assertEqual(arguments[arguments.index("-p") + 1], "/migration/backup.tar.gz")
+                    self.assertNotIn("-d", arguments)
+                    staged = json.loads((wizard.root / "ton-work/controller/mytoncore/mytoncore.db").read_text())
+                    for name, value in retained.items():
+                        self.assertEqual(staged[name], value, "Saved staking setting changed: " + name)
+                    self.assertEqual(json.loads((wizard.root / "ton-work/db/config.json").read_text()), self.node)
+                    with tarfile.open(wizard.root / "backup.tar.gz", "r:gz") as backup:
+                        core = json.load(backup.extractfile("mytoncore/mytoncore.db"))
+                        for name, value in retained.items():
+                            self.assertEqual(core[name], value, "Backup staking setting changed: " + name)
+                        self.assertEqual(json.load(backup.extractfile("db/config.json")), self.node)
+                        self.assertEqual(backup.extractfile("mytoncore/wallets/existing-wallet.pk").read(),
+                                         (self.donor / "mytoncore/wallets/existing-wallet.pk").read_bytes())
+                        self.assertEqual(backup.extractfile("mytoncore/wallets/existing-wallet.addr").read(),
+                                         (self.donor / "mytoncore/wallets/existing-wallet.addr").read_bytes())
+                        for name in extra_files:
+                            member = name[len("ton-work/"):] if name.startswith("ton-work/") else name
+                            target = wizard.root / "ton-work" / (
+                                "controller/" + name if name.startswith("mytoncore/") else member)
+                            self.assertEqual(target.read_bytes(), (self.donor / name).read_bytes())
+                            self.assertEqual(backup.extractfile(member).read(), (self.donor / name).read_bytes())
+                    self.assertFalse(any("setup_collator" in argument or "enable_mode_" in argument
+                                         for call in calls for argument in call))
+                    self.assertFalse(state["container_running"])
+                    self.assertEqual(json.loads((wizard.root / "migration.json").read_text())["phase"], "verified")
+                finally:
+                    self.root, self.donor, self.core, self.node = original_root, original_donor, original_core, original_node
+
+    def test_standalone_collator_service_is_rejected_before_images_or_donor_downtime(self):
+        self.core["modes"] = {"validator": False, "liteserver": False, "collator": True}
+        wizard, calls, state = self.exercise_wizard(fail_at="auxiliary",
+                                                   active_services="collator.service loaded active running Standalone collator\n")
+        self.assertFalse(wizard.donor_stopped)
+        self.assertFalse(state["pulled"])
+        self.assertTrue(state["writer_running"])
+        self.assertTrue(state["container_running"])
+        self.assertFalse(any(call[:2] in (["docker", "stop"], ["docker", "update"], ["docker", "cp"])
+                             or call[-2:-1] == ["stop"] for call in calls))
+
+    def test_conflicting_saved_node_modes_are_rejected_before_any_donor_changes(self):
+        original_root, original_donor, original_core = self.root, self.donor, self.core
+        for conflicting in ("liteserver", "collator"):
+            with self.subTest(conflicting=conflicting):
+                try:
+                    self.root = original_root / (conflicting + "-conflict")
+                    self.root.mkdir()
+                    self.donor = self.root / "donor"
+                    self.donor.mkdir()
+                    self.core = copy.deepcopy(CORE_CONFIG)
+                    self.core["modes"] = {"validator": True, conflicting: True}
+                    wizard, calls, state = self.exercise_wizard(fail_at="mode-conflict", legacy_env={"MODE": conflicting})
+                    self.assertIsNone(wizard.root)
+                    self.assertFalse(wizard.donor_stopped)
+                    self.assertFalse(state["pulled"])
+                    self.assertTrue(state["writer_running"])
+                    self.assertTrue(state["container_running"])
+                    self.assertFalse(any(call[:2] in (["docker", "stop"], ["docker", "update"], ["docker", "cp"])
+                                         or call[-2:-1] == ["stop"] for call in calls))
+                finally:
+                    self.root, self.donor, self.core = original_root, original_donor, original_core
+
+    def test_ambiguous_staking_validator_flag_is_rejected_before_any_donor_changes(self):
+        self.core["modes"] = {"nominator-pool-v2": True}
+        wizard, calls, state = self.exercise_wizard(fail_at="ambiguous-validator")
+        self.assertIsNone(wizard.root)
+        self.assertFalse(wizard.donor_stopped)
+        self.assertFalse(state["pulled"])
+        self.assertTrue(state["writer_running"])
+        self.assertTrue(state["container_running"])
+        self.assertFalse(any(call[:2] in (["docker", "stop"], ["docker", "update"], ["docker", "cp"])
+                             or call[-2:-1] == ["stop"] for call in calls))
+
+    def assert_changed_collator_state_stops_destination(self, updates):
+        self.core["modes"] = {"validator": False, "liteserver": False, "collator": True}
+        self.node.update({"collators": ["saved-collator-adnl"],
+                          "extraconfig": {"collator_node_whitelist": {"enabled": True,
+                                                                     "adnl_ids": ["saved-validator"]}}})
+        wizard, calls, state = self.exercise_wizard(fail_at="runtime", runtime_node_update=updates)
+        self.assertTrue(wizard.donor_stopped)
+        self.assertFalse(wizard.destination_attempted)
+        self.assertFalse(state["container_running"])
+        self.assertIn("collator", state["error"].lower())
+        self.assertTrue(any(call[-3:] == ["stop", "--timeout", "120"] for call in calls))
+        self.assertFalse(any(call[:2] == ["docker", "start"] for call in calls))
+
+    def test_changed_runtime_collator_adnl_stops_the_destination(self):
+        self.assert_changed_collator_state_stops_destination({"collators": ["new-unexpected-collator-adnl"]})
+
+    def test_changed_runtime_collator_whitelist_stops_the_destination(self):
+        self.assert_changed_collator_state_stops_destination({
+            "extraconfig": {"collator_node_whitelist": {"enabled": False, "adnl_ids": ["saved-validator"]}},
+        })
+
+    def test_changed_runtime_collator_whitelist_ids_stop_the_destination(self):
+        self.assert_changed_collator_state_stops_destination({
+            "extraconfig": {"collator_node_whitelist": {"enabled": True, "adnl_ids": ["unexpected-validator"]}},
+        })
+
+    def test_new_runtime_collator_setting_stops_the_destination(self):
+        self.assert_changed_collator_state_stops_destination({"collator_whitelist": ["unexpected-validator"]})
+
+    def test_runtime_certificate_metadata_changes_and_whitelist_order_do_not_change_collator_permissions(self):
+        self.core["modes"] = {"validator": False, "liteserver": False, "collator": True}
+        self.node.update({"collators": ["saved-collator-adnl"],
+                          "extraconfig": {"collator_node_whitelist": {"enabled": True,
+                                                                     "adnl_ids": ["first-validator", "second-validator"]},
+                                          "fast_sync_certificate": {"expires_at": 100}}})
+        updates = {"extraconfig": {"collator_node_whitelist": {"enabled": True,
+                                                               "adnl_ids": ["second-validator", "first-validator"]},
+                                   "fast_sync_certificate": {"expires_at": 200}}}
+        wizard, _, _ = self.exercise_wizard(runtime_node_update=updates)
+        self.assertEqual(json.loads((wizard.root / "migration.json").read_text())["phase"], "verified")
+        self.assertTrue(wizard.destination_attempted)
+
+    def test_disabled_empty_whitelist_serialization_formats_preserve_the_same_permissions(self):
+        for extra in (None, {}, {"collator_node_whitelist": None},
+                      {"collator_node_whitelist": {"enabled": False, "adnl_ids": []}}):
+            with self.subTest(extraconfig=extra):
+                self.assertEqual(self.wizard.collator_whitelist({"extraconfig": extra}),
+                                 self.wizard.collator_whitelist({}))
 
     def test_recent_background_metadata_changes_are_copied_from_offline_controller(self):
         updates = {"lastScan": 123456, "customPools": ["updated-pool"], "statistics": {"load": 42}}
