@@ -65,10 +65,13 @@ COPY docker/entrypoint.py docker/console.py docker/run-service.py docker/mytonct
 COPY docker/export-ton.sh /usr/local/lib/mytonctrl/export-ton.sh
 COPY docker/systemctl.py /usr/local/bin/systemctl
 COPY docker/supervisord.conf /etc/supervisor/mytonctrl.conf
+COPY docker/bash-aliases.sh /etc/mytonctrl-aliases.sh
 RUN chmod 755 /usr/local/bin/systemctl \
     && mkdir -p /opt/mytonctrl/bin \
     && ln -s /usr/local/lib/mytonctrl/console.py /opt/mytonctrl/bin/mytonctrl \
-    && chmod 755 /usr/local/lib/mytonctrl/console.py
+    && chmod 755 /usr/local/lib/mytonctrl/console.py \
+    && chmod 644 /etc/mytonctrl-aliases.sh \
+    && printf '\n. /etc/mytonctrl-aliases.sh\n' >> /etc/bash.bashrc
 WORKDIR /var/ton-work
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/opt/mytonctrl/venv/bin/python", "/usr/local/lib/mytonctrl/entrypoint.py"]

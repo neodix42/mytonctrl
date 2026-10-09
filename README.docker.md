@@ -317,6 +317,40 @@ check default. Explicit console arguments take precedence for options with value
 The publishing workflows use `dev` for commits to `dev`, `latest` for commits to
 `master`, and a required tag input for manual builds.
 
+### Bash aliases
+
+Open an interactive Bash shell to use the image's local node shortcuts:
+
+```sh
+docker compose exec mytonctrl bash
+# Without Compose: docker exec -it mytonctrl bash
+getstats
+last
+config34
+sync
+```
+
+These are Bash commands; enter them outside the `MyTonCtrl>` prompt.
+
+| Alias | Query |
+| --- | --- |
+| `config32`, `config34`, `config36` | Local network configuration parameters 32, 34 and 36. |
+| `elid` | Elector's active election ID. |
+| `participants` | Elector's participant list. |
+| `getstats` | Local validator console statistics. |
+| `last` | Latest masterchain block known to the local liteserver. |
+| `sync` | Age of that block in seconds. |
+| `egrep` | `grep -E` with automatic color. |
+
+The aliases use the container's active TON binaries and keys. They read the
+console and liteserver ports from `db/config.json` with `jq` on every invocation,
+so they follow ports configured in `.env` or retained during migration. Custom
+`-W` work directories are supported. They require the corresponding node
+endpoints to have been initialized; local results can lag while syncing.
+`last` and `sync` override the usual Linux commands in Bash; use `command last`
+or `command sync` to call those tools. Aliases arrive with the updated controller
+image and require no `.env` or migration script changes.
+
 ## Run a benchmark
 
 The controller image includes `uv`, Python 3.14 and TON's Python benchmark
