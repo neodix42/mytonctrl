@@ -152,6 +152,20 @@ the old node; archive databases can require many terabytes. The destination must
 be separate from all of the old installation's data directories. Keep the old
 container, image, volumes and deployment files until migration is verified.
 
+The wizard checks the space for the whole migration: the full data and legacy
+controller copies, identity staging, backup archive, controller import and
+temporary backup extraction. It measures the TON artifacts and checks Docker
+storage for the exported binaries and their running snapshot, including separate
+volume or writable-layer mounts. If storage locations share a filesystem, it
+adds their requirements together. Estimates
+assume no compression or sparse-file savings and retain at least 10% or 1 GiB
+of extra space per storage area for metadata, logs and initial growth.
+Images are pulled while the old node is running; the wizard checks the remaining
+space again after pulling and immediately before downtime. It also rechecks
+after stopping the node, before backup creation and before startup. Insufficient
+space stops migration and preserves the original data. Keep monitoring free
+space as the migrated node syncs and its database grows.
+
 ### What the wizard does
 
 The wizard identifies the old container and asks you to review its network,

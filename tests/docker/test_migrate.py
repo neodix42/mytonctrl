@@ -348,7 +348,15 @@ class MigrationFixture(unittest.TestCase):
         self.assertEqual(file_digests(self.donor), before)
 
     def test_donor_probe_inventories_full_history_and_refuses_external_wallet_links(self):
-        before = self.create_legacy_data()
+        self.create_legacy_data()
+        ignored = self.donor / "mytoncore/venv/ignored-interpreter"
+        ignored.parent.mkdir()
+        with ignored.open("wb") as output:
+            output.truncate(4 * 2**20)
+        sparse = self.donor / "ton-work/db/sparse-data"
+        with sparse.open("wb") as output:
+            output.truncate(8 * 2**20)
+        before = file_digests(self.donor)
         proc = self.root / "proc" / "1234"
         proc.mkdir(parents=True)
         (proc / "cmdline").write_bytes(
@@ -379,6 +387,13 @@ class MigrationFixture(unittest.TestCase):
             self.assertIn("ton-work/db/" + name, probe["sizes"])
         self.assertIn("mytoncore/wallets/existing-wallet.pk", probe["hashes"])
         self.assertIn("ton-work/db/keyring/node-key", probe["hashes"])
+        self.assertNotIn("mytoncore/venv/ignored-interpreter", probe["sizes"])
+        self.assertGreaterEqual(probe["copy_totals"]["mytoncore"]["bytes"], ignored.stat().st_size)
+        self.assertEqual(probe["sizes"]["ton-work/db/sparse-data"], sparse.stat().st_size)
+        self.assertGreaterEqual(probe["copy_totals"]["ton-work"]["bytes"], sparse.stat().st_size)
+        self.assertGreater(probe["copy_totals"]["ton-work"]["entries"], 1)
+        self.assertEqual(probe["config_bytes"], sum(path.stat().st_size for path in
+                                                  (self.donor / "ton-runtime").glob("*.config.json")))
         self.assertEqual(file_digests(self.donor), before)
         (self.donor / "mytoncore/wallets/external.pk").symlink_to("/etc/shadow")
         with mock.patch("pathlib.Path", side_effect=isolated_path), redirect_stdout(io.StringIO()):
@@ -411,6 +426,7 @@ class MigrationFixture(unittest.TestCase):
                     "/usr/bin/ton": self.donor / "ton-runtime"}
         inspected = {"Id": "donor-id", "State": {"Running": True},
                      "Config": {"Env": ["NETWORK=mainnet"]}, "HostConfig": {},
+                     "GraphDriver": {"Name": "overlay2", "Data": {"UpperDir": str(self.root)}},
                      "Mounts": [{"Destination": name, "Source": str(source)}
                                 for name, source in mappings.items() if name != "/usr/bin/ton"]}
         if restart_policy is not None:
@@ -419,15 +435,25 @@ class MigrationFixture(unittest.TestCase):
                  if not name.startswith("ton-runtime/")}
         hashes = {name: digest for name, digest in before.items()
                   if name.startswith(("ton-work/db/keyring/", "ton-work/keys/", "mytoncore/wallets/"))}
-        state = {"writer_running": True, "container_running": True, "probes": 0}
+        copy_totals = {}
+        for name in ("ton-work", "mytoncore", "mytonctrl"):
+            paths = list((self.donor / name).rglob("*"))
+            copy_totals[name] = {"bytes": sum(path.lstat().st_size for path in paths
+                                              if path.is_file() or path.is_symlink()), "entries": len(paths) + 1}
+        config_bytes = sum(path.stat().st_size for path in (self.donor / "ton-runtime").glob("*.config.json"))
+        state = {"writer_running": True, "container_running": True, "probes": 0, "pulled": False}
         calls = []
 
         def probe():
             state["probes"] += 1
+            totals = copy.deepcopy(copy_totals)
+            if fail_at == "offline-space" and not state["writer_running"]:
+                totals["ton-work"]["bytes"] += 2**45
             return {"core": copy.deepcopy(self.core if state["probes"] == 1 else latest_core),
                     "node": copy.deepcopy(self.node if state["probes"] == 1 else latest_node),
                     "command": command if state["writer_running"] else None,
                     "sizes": sizes, "hashes": hashes, "log_links": [],
+                    "copy_totals": totals, "config_bytes": config_bytes,
                     "configs": {"global.config.json": "/usr/bin/ton/global.config.json",
                                 "local.config.json": "/usr/bin/ton/local.config.json"}}
 
@@ -449,6 +475,8 @@ class MigrationFixture(unittest.TestCase):
                 operation = args[len(wizard.compose):]
                 if operation == ["pull"] and fail_at == "pull":
                     raise self.wizard.MigrationError("injected image pull failure")
+                if operation == ["pull"]:
+                    state["pulled"] = True
                 if operation and operation[0] == "up":
                     (migration / "ton-work/controller/initialized.json").write_text("{}")
                 if operation[:4] == ["exec", "-T", "mytonctrl", "python3"]:
@@ -458,6 +486,9 @@ class MigrationFixture(unittest.TestCase):
                 return ""
             if args[:2] == ["docker", "ps"]:
                 return "original-node legacy:image Up"
+            if args[:2] == ["docker", "info"]:
+                self.assertEqual(args[-1], "{{.DockerRootDir}}")
+                return str(self.root)
             if args[:2] == ["docker", "inspect"]:
                 return json.dumps([inspected]) if len(args) == 3 else str(state["container_running"]).lower()
             if args[:4] == ["docker", "exec", "donor-id", "cat"]:
@@ -488,6 +519,8 @@ class MigrationFixture(unittest.TestCase):
                     shutil.copy2(original, destination)
                 return ""
             if args[:2] == ["docker", "run"]:
+                if "du" in args:
+                    return "1024 /usr/local/bin\n512 /usr/lib/fift\n256 /usr/share/ton/smartcont\n"
                 if "--mount" in args:
                     self.assertTrue((migration / "backup.tar.gz").is_file())
                 else:
@@ -504,8 +537,18 @@ class MigrationFixture(unittest.TestCase):
             stdout.write("saved legacy stdout log\n")
             return subprocess.CompletedProcess(args, 0)
 
+        def capacity(path):
+            free = 2**40
+            if fail_at == "after-pull-space" and state["pulled"]:
+                free = 0
+            if fail_at == "current-space" and state["probes"] >= 2:
+                free = 0
+            return types.SimpleNamespace(free=free)
+
         with mock.patch.object(wizard, "validate_host"), mock.patch.object(wizard, "probe", side_effect=probe), \
                 mock.patch.object(wizard, "check_ports"), mock.patch.object(self.wizard, "download", side_effect=download), \
+                mock.patch.object(wizard, "measure_logs", return_value=128), \
+                mock.patch.object(self.wizard.shutil, "disk_usage", side_effect=capacity), \
                 mock.patch.object(self.wizard, "run", side_effect=run), \
                 mock.patch.object(self.wizard.time, "sleep", side_effect=AssertionError("Unexpected service wait")), \
                 mock.patch.object(self.wizard.subprocess, "run", side_effect=logs), redirect_stdout(io.StringIO()):
@@ -653,6 +696,159 @@ class MigrationFixture(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((controller / "mytoncore/wallets/existing-wallet.pk").stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.donor / "ton-runtime/global.config.json").stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.donor / "ton-runtime/local.config.json").stat().st_mode), 0o600)
+
+    def space_probe(self):
+        return {
+            "sizes": {
+                "ton-work/db/archive/history": 8 * 2**30,
+                "ton-work/db/config.json": 512,
+                "ton-work/db/keyring/key": 128,
+                "ton-work/keys/client": 64,
+                "mytoncore/mytoncore.db": 2 * 2**20,
+                "mytoncore/wallets/wallet.pk": 64,
+                "mytonctrl/mytonctrl.db": 256,
+            },
+            "copy_totals": {
+                "ton-work": {"bytes": 8 * 2**30 + 704, "entries": 12},
+                "mytoncore": {"bytes": 2**30 + 2 * 2**20 + 64, "entries": 8},
+                "mytonctrl": {"bytes": 256, "entries": 3},
+            },
+            "config_bytes": 1024,
+        }
+
+    def test_space_budget_includes_complete_copy_and_identity_copies_without_compression_credit(self):
+        probe = self.space_probe()
+        plan = self.wizard.migration_space_plan(probe, log_bytes=4096)
+        self.assertGreaterEqual(plan["copy"], 9 * 2**30 + 4096 + probe["config_bytes"])
+        identity = sum(size for name, size in probe["sizes"].items()
+                       if name.startswith(("mytoncore/", "ton-work/keys/", "ton-work/db/keyring/"))
+                       or name == "ton-work/db/config.json")
+        core = 2 * 2**20 + 64
+        self.assertGreaterEqual(plan["stage"], identity + 256 + probe["config_bytes"])
+        self.assertGreater(plan["archive"], identity)
+        self.assertGreaterEqual(plan["restore"], identity)
+        self.assertGreaterEqual(plan["prime"], core)
+        self.assertGreaterEqual(plan["startup"], core)
+        self.assertGreaterEqual(plan["reserve"], 2**30)
+        # Ignored venv bytes are retained by docker cp but do not enter the
+        # identity archive or controller's additional copies.
+        more_venv = copy.deepcopy(probe)
+        more_venv["copy_totals"]["mytoncore"]["bytes"] += 2**30
+        larger = self.wizard.migration_space_plan(more_venv, log_bytes=4096)
+        self.assertEqual(larger["copy"] - plan["copy"], 2**30)
+        for phase in ("stage", "archive", "prime", "startup", "restore"):
+            self.assertEqual(larger[phase], plan[phase])
+
+    def test_disk_space_combines_requirements_on_the_same_device(self):
+        data = self.root / "data"
+        docker = self.root / "docker"
+        with mock.patch.object(Path, "stat", autospec=True, return_value=types.SimpleNamespace(st_dev=1)), \
+                mock.patch.object(self.wizard.shutil, "disk_usage", return_value=types.SimpleNamespace(free=100)), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(self.wizard.MigrationError):
+                self.wizard.check_disk_space([("migration data", data, 70), ("Docker restore", docker, 60)])
+
+    def test_disk_space_checks_separate_devices_independently(self):
+        data = self.root / "data"
+        docker = self.root / "docker"
+        def device(path):
+            return types.SimpleNamespace(st_dev=1 if path == data else 2)
+        with mock.patch.object(Path, "stat", autospec=True, side_effect=device), \
+                mock.patch.object(self.wizard.shutil, "disk_usage", return_value=types.SimpleNamespace(free=100)), \
+                redirect_stdout(io.StringIO()):
+            self.wizard.check_disk_space([("migration data", data, 70), ("Docker restore", docker, 60)])
+
+    def test_post_pull_low_space_preserves_running_donor_and_restart_policy(self):
+        wizard, calls, state = self.exercise_wizard(
+            fail_at="after-pull-space", restart_policy={"Name": "always", "MaximumRetryCount": 0}
+        )
+        self.assertTrue(state["pulled"])
+        self.assertFalse(wizard.donor_stopped)
+        self.assertTrue(state["writer_running"])
+        self.assertTrue(state["container_running"])
+        self.assertFalse(any(call[:2] in (["docker", "stop"], ["docker", "update"], ["docker", "cp"])
+                             or call[-2:-1] == ["stop"] for call in calls))
+
+    def test_current_pre_downtime_low_space_preserves_running_donor_and_restart_policy(self):
+        wizard, calls, state = self.exercise_wizard(
+            fail_at="current-space", restart_policy={"Name": "always", "MaximumRetryCount": 0}
+        )
+        self.assertGreaterEqual(state["probes"], 2)
+        self.assertFalse(wizard.donor_stopped)
+        self.assertTrue(state["writer_running"])
+        self.assertTrue(state["container_running"])
+        self.assertFalse(any(call[:2] in (["docker", "stop"], ["docker", "update"], ["docker", "cp"])
+                             or call[-2:-1] == ["stop"] for call in calls))
+
+    def test_offline_source_growth_is_rejected_before_copying(self):
+        wizard, calls, state = self.exercise_wizard(fail_at="offline-space")
+        self.assertTrue(wizard.donor_stopped)
+        self.assertFalse(state["writer_running"])
+        self.assertFalse(state["container_running"])
+        self.assertFalse(any(call[:2] == ["docker", "cp"] for call in calls))
+        self.assertFalse(any("up" in call for call in calls))
+
+    def test_remaining_space_rechecks_do_not_charge_completed_phases_again(self):
+        wizard = self.wizard.Wizard()
+        wizard.root = self.root / "migration"
+        wizard.docker_root = self.root / "docker"
+        wizard.docker_root.mkdir()
+        wizard.log_bytes = 4096
+        wizard.artifact_bytes = 2048
+        requests = []
+        probe = self.space_probe()
+        plan = self.wizard.migration_space_plan(probe, log_bytes=4096)
+        with mock.patch.object(self.wizard.os, "statvfs", return_value=types.SimpleNamespace(f_frsize=4096)), \
+                mock.patch.object(self.wizard, "check_disk_space", side_effect=lambda requirements: requests.append(requirements)):
+            for phase in ("copy", "stage", "archive", "startup"):
+                wizard.check_space(probe, phase)
+        self.assertEqual(requests[0][0][2] - requests[1][0][2], plan["copy"])
+        self.assertEqual(requests[1][0][2] - requests[2][0][2], plan["stage"])
+        self.assertEqual(requests[3][0][2], plan["startup"] + plan["reserve"])
+        self.assertEqual({sum(item[2] for item in requirements[1:]) for requirements in requests},
+                         {sum(item[2] for item in requests[0][1:])})
+        self.assertGreaterEqual(sum(item[2] for item in requests[0][1:]),
+                                plan["restore"] + 2 * wizard.artifact_bytes + 2**30)
+
+    def test_docker_storage_uses_actual_upper_layer_and_volume_directory(self):
+        docker_root = self.root / "docker-root"
+        volumes = docker_root / "volumes"
+        volumes.mkdir(parents=True)
+        upper = self.root / "independent-writable-layer"
+        upper.mkdir()
+        inspected = {"GraphDriver": {"Name": "overlay2", "Data": {"UpperDir": str(upper)}}}
+        self.assertEqual(self.wizard.docker_storage_paths(inspected, docker_root), (volumes, upper))
+
+    def test_docker_storage_rejects_missing_explicit_upper_layer(self):
+        docker_root = self.root / "docker-root"
+        (docker_root / "overlay2").mkdir(parents=True)
+        inspected = {"GraphDriver": {"Name": "overlay2", "Data": {"UpperDir": str(self.root / "missing-layer")}}}
+        with self.assertRaises(self.wizard.MigrationError):
+            self.wizard.docker_storage_paths(inspected, docker_root)
+
+    def test_docker_storage_refuses_unknown_store_instead_of_assuming_root_filesystem(self):
+        docker_root = self.root / "docker-root"
+        docker_root.mkdir()
+        # Ignore any unrelated containerd store on the host running the tests.
+        with mock.patch.object(Path, "is_dir", autospec=True, side_effect=lambda path: path == docker_root):
+            with self.assertRaises(self.wizard.MigrationError):
+                self.wizard.docker_storage_paths({}, docker_root)
+
+    def test_container_log_measurement_streams_all_bytes_and_rejects_driver_failure(self):
+        wizard = self.wizard.Wizard()
+        wizard.old_id = "original-container"
+        contents = b"rotated log line\n" * 100000 + b"last log line\n"
+        process = mock.MagicMock()
+        process.__enter__.return_value = process
+        process.stdout = io.BytesIO(contents)
+        process.wait.return_value = 0
+        with mock.patch.object(self.wizard.subprocess, "Popen", return_value=process):
+            self.assertEqual(wizard.measure_logs(), len(contents))
+        process.stdout = io.BytesIO(b"logger driver error\n")
+        process.wait.return_value = 1
+        with mock.patch.object(self.wizard.subprocess, "Popen", return_value=process):
+            with self.assertRaises(self.wizard.MigrationError):
+                wizard.measure_logs()
 
 
 if __name__ == "__main__":

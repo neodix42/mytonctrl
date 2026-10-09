@@ -301,8 +301,87 @@ def zero_state(config):
     return (state.get('root_hash'), state.get('file_hash'))
 
 
+def migration_space_plan(probe, log_bytes=0, block_size=4096):
+    """Budget every retained copy; sparse files and compression get no credit."""
+    block_size = max(4096, block_size)
+
+    def stored_files(files):
+        directories = {str(parent) for name in files for parent in Path(name).parents}
+        return sum(files.values()) + (2 * len(files) + len(directories)) * block_size
+
+    core = {name: size for name, size in probe['sizes'].items() if name.startswith('mytoncore/')}
+    console = {name: size for name, size in probe['sizes'].items() if name.startswith('mytonctrl/')}
+    identity = {name: size for name, size in probe['sizes'].items()
+                if name.startswith(('mytoncore/', 'ton-work/keys/', 'ton-work/db/keyring/'))
+                or name in ('ton-work/db/config.json', 'ton-work/db/collators-list.json')}
+    # Full legacy copies include virtual environments/cache excluded from the
+    # identity inventory. Docker cp also copies those trees and normal log files.
+    copied = sum(item['bytes'] + 2 * item['entries'] * block_size
+                 for item in probe['copy_totals'].values())
+    identity_bytes = stored_files(identity)
+    core_bytes = stored_files(core)
+    # Allow tar/PAX padding and gzip overhead even for incompressible contents.
+    archive_bytes = identity_bytes + (identity_bytes + 99) // 100 + 10240
+    plan = {'copy': copied + log_bytes + probe['config_bytes'],
+            'stage': identity_bytes + stored_files(console) + probe['config_bytes'],
+            'archive': archive_bytes, 'prime': core_bytes,
+            'startup': core_bytes,  # Installer also retains mytoncore.db.backup.
+            'restore': identity_bytes}
+    peak = sum(plan[name] for name in ('copy', 'stage', 'archive', 'prime', 'startup'))
+    # Keep the original reserve at later checkpoints, including initial node growth.
+    plan['reserve'] = max(2**30, (peak + 9) // 10)
+    return plan
+
+
+def check_disk_space(requirements):
+    """Combine allocations on the same filesystem instead of counting free space twice."""
+    filesystems = {}
+    for label, path, required in requirements:
+        path = Path(path)
+        device = path.stat().st_dev
+        available = shutil.disk_usage(path).free
+        group = filesystems.setdefault(device, {'path': path, 'labels': [], 'required': 0, 'free': available})
+        group['labels'].append(label)
+        group['required'] += required
+        group['free'] = min(group['free'], available)
+    for group in filesystems.values():
+        label = ' + '.join(group['labels'])
+        print(f"Disk space ({label}, {group['path']}): required {group['required'] / 2**30:.2f} GiB; "
+              f"available {group['free'] / 2**30:.2f} GiB.")
+        if group['free'] < group['required']:
+            raise MigrationError(f"Not enough free disk space for {label}: need {group['required'] / 2**30:.2f} GiB, "
+                                 f"available {group['free'] / 2**30:.2f} GiB on {group['path']}. "
+                                 'Free space or select a larger destination; original data was preserved.')
+
+
+def docker_storage_paths(inspected, root):
+    """Volumes and writable layers may be mounted on different host filesystems."""
+    root = Path(root)
+    volumes = root / 'volumes'
+    volumes = volumes if volumes.is_dir() else root
+    upper = inspected.get('GraphDriver', {}).get('Data', {}).get('UpperDir')
+    if upper:
+        writable = Path(upper)
+        if not writable.is_absolute() or not writable.is_dir():
+            raise MigrationError('Cannot inspect the Docker writable-layer filesystem on this host.')
+        return volumes, writable
+    # Docker's managed containerd and the standard system containerd store can
+    # also be independent mounts. Do not charge their data to DockerRootDir.
+    driver = inspected.get('GraphDriver', {}).get('Name')
+    candidates = {'overlay2': (root / 'overlay2',), 'vfs': (root / 'vfs',), 'btrfs': (root / 'btrfs',)}
+    containerd = (root / 'containerd/daemon/io.containerd.snapshotter.v1.overlayfs',
+                  Path('/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs'))
+    found = [path for path in candidates.get(driver, containerd if driver in (None, '', 'overlayfs') else ())
+             if path.is_dir()]
+    if len({path.stat().st_dev for path in found}) > 1:
+        raise MigrationError('Multiple containerd storage filesystems detected; confirm the active Docker store before migration.')
+    if found:
+        return volumes, found[0]
+    raise MigrationError('Cannot determine Docker writable storage for the disk-space check; original node was not stopped.')
+
+
 SOURCE_PROBE = r'''
-import hashlib, json, os
+import hashlib, json, os, stat
 from pathlib import Path
 def read(path):
     return json.loads(Path(path).read_text())
@@ -315,9 +394,18 @@ for proc in Path('/proc').glob('[0-9]*'):
         if args and Path(args[0]).name == 'validator-engine': commands.append(args)
     except (OSError, UnicodeError): pass
 if len(commands) > 1: raise SystemExit('Expected at most one validator-engine')
-sizes, hashes, links = {}, {}, []
+sizes, hashes, links, copy_totals = {}, {}, [], {}
 for name, location in [('ton-work', '/var/ton-work'), ('mytoncore', '/usr/local/bin/mytoncore'), ('mytonctrl', '/usr/local/bin/mytonctrl')]:
     base = Path(location)
+    # Separate unfiltered accounting: docker cp retains ignored venv/cache/logs.
+    total, entries = 0, 1
+    for directory, directories, files in os.walk(base, followlinks=False):
+        for child in directories + files:
+            info = (Path(directory) / child).lstat()
+            entries += 1
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                total += info.st_size
+    copy_totals[name] = dict(bytes=total, entries=entries)
     for directory, directories, files in os.walk(base, followlinks=False):
         for child in directories + files:
             path = Path(directory) / child
@@ -337,11 +425,13 @@ for name, location in [('ton-work', '/var/ton-work'), ('mytoncore', '/usr/local/
                     hashes[key] = hashlib.sha256(path.read_bytes()).hexdigest()
             elif child not in directories:
                 raise SystemExit('Unsupported nonregular data file: ' + key)
-configs = {}
+configs, config_bytes = {}, 0
 for name in ('global.config.json', 'local.config.json'):
     path = Path('/usr/bin/ton') / name
-    if path.is_file(): configs[name] = str(path.resolve(strict=True))
-print(json.dumps(dict(node=node, core=core, command=commands[0] if commands else None, sizes=sizes, hashes=hashes, log_links=links, configs=configs)))
+    if path.is_file():
+        configs[name] = str(path.resolve(strict=True))
+        config_bytes += path.stat().st_size
+print(json.dumps(dict(node=node, core=core, command=commands[0] if commands else None, sizes=sizes, hashes=hashes, log_links=links, configs=configs, copy_totals=copy_totals, config_bytes=config_bytes)))
 '''
 
 
@@ -358,6 +448,11 @@ class Wizard:
         self.compose_env = None
         self.project = ''
         self.settings = {}
+        self.docker_root = None
+        self.docker_volumes = None
+        self.docker_writable = None
+        self.artifact_bytes = 0
+        self.log_bytes = 0
 
     def ask(self, title, default=None):
         suffix = f' [{default}]' if default is not None else ''
@@ -421,6 +516,37 @@ class Wizard:
     def probe(self):
         return json.loads(run(['docker', 'exec', self.old_id, 'python3', '-c', SOURCE_PROBE]))
 
+    def measure_logs(self):
+        # docker logs can include rotations and non-file logging drivers. Count
+        # the actual export stream without writing it or keeping it in memory.
+        with subprocess.Popen(['docker', 'logs', '--timestamps', self.old_id], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT) as process:
+            size = sum(len(chunk) for chunk in iter(lambda: process.stdout.read(1024 * 1024), b''))
+            if process.wait():
+                raise MigrationError('Cannot measure the original container log export.')
+        return size
+
+    def check_space(self, probe, phase='copy'):
+        destination = self.root if self.root.exists() else self.root.parent
+        volumes = self.docker_volumes or self.docker_root
+        writable = self.docker_writable or self.docker_root
+        block = max(os.statvfs(path).f_frsize for path in (destination, volumes, writable))
+        plan = migration_space_plan(probe, self.log_bytes, block)
+        phases = ('copy', 'stage', 'archive', 'prime', 'startup')
+        remaining = sum(plan[name] for name in phases[phases.index(phase):])
+        # Backup extraction in /tmp and the artifact volume plus /run snapshot
+        # all live in Docker storage, rather than necessarily on the data disk.
+        docker_bytes = plan['restore'] + self.artifact_bytes
+        docker_reserve = max(2**30, (docker_bytes + 9) // 10)
+        artifact_reserve = max(2**30, (self.artifact_bytes + 9) // 10)
+        if writable.stat().st_dev == volumes.stat().st_dev:
+            # One reserve for Docker allocations sharing a filesystem.
+            docker_reserve = max(2**30, (docker_bytes + self.artifact_bytes + 9) // 10)
+            artifact_reserve = 0
+        check_disk_space([('migration data', destination, remaining + plan['reserve']),
+                          ('Docker restore/snapshot', writable, docker_bytes + docker_reserve),
+                          ('Docker artifact volumes', volumes, self.artifact_bytes + artifact_reserve)])
+
     def execute(self):
         self.validate_host()
         print('MyTonCtrl migration wizard: same-host, offline copy; original data is never removed.\n')
@@ -478,12 +604,14 @@ class Wizard:
         parent = Path(self.ask('New migration directory on the mounted data disk', '/mnt/ton/mytonctrl-migration'))
         self.root = ensure_destination_isolated(parent, [item['Source'] for item in mounts])
         filesystem = run(['findmnt', '-n', '-o', 'TARGET,SOURCE,FSTYPE', '--target', self.root.parent])
-        total = sum(probe['sizes'].values())
-        free = shutil.disk_usage(self.root.parent).free
         print(f'Destination filesystem: {filesystem.strip()}')
-        print(f'Copy estimate: {total / 2**30:.1f} GiB; available: {free / 2**30:.1f} GiB (allow extra space for growth).')
-        if free < total * 1.1:
-            raise MigrationError('Not enough free space for an independent offline copy plus 10% headroom.')
+        self.docker_root = Path(run(['docker', 'info', '--format', '{{.DockerRootDir}}']).strip())
+        if not self.docker_root.is_absolute() or not self.docker_root.is_dir():
+            raise MigrationError('Cannot inspect Docker storage on this host for the migration space check.')
+        self.docker_volumes, self.docker_writable = docker_storage_paths(inspected, self.docker_root)
+        self.log_bytes = self.measure_logs()
+        self.check_space(probe)
+        print('Space includes staging, backup creation/restoration and at least 10% or 1 GiB reserve per storage area.')
         if filesystem.split()[0] == '/':
             self.confirm('The destination is on the root filesystem. Use this disk anyway?')
         tag = 'dev' if self.branch == 'dev' else 'latest'
@@ -523,7 +651,19 @@ class Wizard:
         run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--workdir', '/tmp',
              '--entrypoint', '/opt/mytonctrl/venv/bin/python', controller_image, '-c',
              'import sys; sys.path.insert(0,"/usr/local/lib/mytonctrl"); from entrypoint import check_backup; from mytoninstaller.settings import update_client_path_settings'])
+        footprint = run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only',
+                         '--entrypoint', 'du', ton_image, '-sbL', '--count-links',
+                         '/usr/local/bin', '/usr/lib/fift', '/usr/share/ton/smartcont'])
+        self.artifact_bytes = sum(int(line.split()[0]) for line in footprint.splitlines())
+        if len(footprint.splitlines()) != 3 or self.artifact_bytes <= 0:
+            raise MigrationError('Cannot measure the selected TON image artifacts.')
+        # Image downloads have already consumed their disk space. Charge only
+        # the remaining work, then refresh again after the user's confirmation.
+        self.check_space(probe)
         self.confirm('Stop the original controller/node now and copy all data? This starts downtime.')
+        print('Rechecking current source sizes and free space before stopping the original node...')
+        self.log_bytes = self.measure_logs()
+        self.check_space(self.probe())
         # Once stopping begins, errors leave the donor stopped; restarting is an explicit rollback.
         self.donor_stopped = True
         self.journal('stopping-donor')
@@ -548,12 +688,16 @@ class Wizard:
         run(['docker', 'stop', '--time', '120', self.old_id], capture=False)
         if run(['docker', 'inspect', self.old_id, '--format', '{{.State.Running}}']).strip() != 'false':
             raise MigrationError('The donor container is still running.')
+        self.log_bytes = self.measure_logs()
+        self.check_space(offline)
         self.journal('copying')
         print('Copying stopped node data. This can take hours for an archive; keep this terminal open.')
         self.copy_data(offline)
+        self.check_space(offline, phase='stage')
         self.stage_import()
         hashes = normalize_identity(self.root)
         (self.root / 'key-checksums.json').write_text(json.dumps(hashes, indent=2))
+        self.check_space(offline, phase='archive')
         backup = create_backup(self.root)
         run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--workdir', '/tmp',
              '--entrypoint', '/opt/mytonctrl/venv/bin/python', '--mount', f'type=bind,src={backup},dst=/migration/backup.tar.gz,readonly',
@@ -563,6 +707,7 @@ class Wizard:
         self.check_ports()
         self.journal('copied-and-validated')
         self.confirm('Offline copy and keys verified. Start the new node now?')
+        self.check_space(offline, phase='startup')
         self.destination_attempted = True
         self.journal('starting-destination')
         self.compose_run(['up', '-d', '--no-build', '--pull', 'never'])
