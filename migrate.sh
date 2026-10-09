@@ -549,8 +549,10 @@ class Wizard:
         print('Before rollback, reconcile any election/stake/wallet transactions broadcast by the new controller.')
 
     def validate_host(self):
-        if sys.platform != 'linux' or os.geteuid() != 0:
-            raise MigrationError('Run on the Docker host with sudo bash migrate.sh (Linux, Python 3.8+, Docker Compose required).')
+        if sys.platform != 'linux':
+            raise MigrationError('Run on the Linux Docker host (Python 3.8+ and Docker Compose required).')
+        if os.geteuid() != 0:
+            raise MigrationError('Migration requires root to preserve file ownership and access private keys and Docker storage. Run sudo bash migrate.sh, or bash migrate.sh from a root shell.')
         for tool in ('docker', 'ss', 'findmnt'):
             if not shutil.which(tool):
                 raise MigrationError(f'Install {tool} before running the wizard.')
@@ -749,7 +751,7 @@ class Wizard:
         if (any(offline['node'].get(key) != probe['node'].get(key) for key in node_fields)
                 or any(offline['core'].get(key) != probe['core'].get(key) for key in identity_fields)):
             raise MigrationError('Donor settings changed during migration planning; retained donor needs review.')
-        run(['docker', 'stop', '--time', '120', self.old_id], capture=False)
+        run(['docker', 'stop', '--timeout', '120', self.old_id], capture=False)
         if run(['docker', 'inspect', self.old_id, '--format', '{{.State.Running}}']).strip() != 'false':
             raise MigrationError('The donor container is still running.')
         self.log_bytes = self.measure_logs()
@@ -1004,7 +1006,7 @@ def main():
         try:
             wizard.stop_destination()
             if wizard.donor_stopped:
-                run(['docker', 'stop', '--time', '120', wizard.old_id], capture=False)
+                run(['docker', 'stop', '--timeout', '120', wizard.old_id], capture=False)
             wizard.journal('stopped-for-review')
         except (MigrationError, OSError) as stop_error:
             print('Could not confirm destination shutdown: ' + str(stop_error), file=sys.stderr)

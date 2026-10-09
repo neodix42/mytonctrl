@@ -543,7 +543,7 @@ class MigrationFixture(unittest.TestCase):
                 wizard.compose_run.assert_called_once_with(["stop", "--timeout", "120"], capture=True)
                 self.assertFalse(wizard.destination_attempted)
                 self.assertTrue(wizard.donor_stopped)
-                run.assert_called_once_with(["docker", "stop", "--time", "120", "original-donor"], capture=False)
+                run.assert_called_once_with(["docker", "stop", "--timeout", "120", "original-donor"], capture=False)
                 self.assertIn("original container", stdout.getvalue())
                 self.assertIn("remain stopped", stdout.getvalue())
 
@@ -762,6 +762,7 @@ class MigrationFixture(unittest.TestCase):
                     return active_services
                 return ""
             if args[:2] == ["docker", "stop"]:
+                self.assertEqual(args[2:4], ["--timeout", "120"])
                 state["container_running"] = False
                 return ""
             if args[:2] == ["docker", "update"]:

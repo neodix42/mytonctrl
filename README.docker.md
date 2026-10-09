@@ -142,6 +142,11 @@ wget -O migrate.sh https://raw.githubusercontent.com/neodiX42/mytonctrl/master/m
 sudo bash migrate.sh
 ```
 
+The migration requires root privileges to preserve the donor's file ownership,
+read private keys and inspect Docker storage for disk-space checks. Membership
+in the `docker` group alone is insufficient. If already in a root shell, run
+`bash migrate.sh` without `sudo`.
+
 For the dev version, download from `dev` and run `sudo bash migrate.sh --branch dev`.
 Use `bash migrate.sh --help` for options. Download the script before running it;
 the wizard needs an interactive terminal for its questions and confirmations.
