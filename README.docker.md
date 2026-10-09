@@ -176,20 +176,24 @@ space as the migrated node syncs and its database grows.
 
 The wizard identifies the old container and asks you to review its network,
 node mode, advertised IP, ports, retention settings and replacement images. It
-asks where to store migration files and node data, then requests confirmation
-before stopping the old node and before starting the replacement.
+asks for the node storage type first, then requests confirmation before stopping
+the old node and before starting the replacement:
 
-The suggested migration directory is `<current-directory>/migration`. Compose
-files are stored in its `deployment` subdirectory. Node storage is a separate
-choice:
-
-- **Host directory (default):** accepts a custom absolute path, with
-  `<migration-directory>/ton-work` suggested. The wizard sets `TON_WORK_HOST_DIR`
-  to that directory. Choose a path on your mounted data disk to keep node data
-  off the root filesystem.
-- **Docker volume:** creates a new named volume, suggesting an unused name.
+- **Host directory (default):** asks for the migration directory, suggesting
+  `<current-directory>/migration`, then asks for the TON work directory,
+  suggesting `<migration-directory>/ton-work`. The wizard sets
+  `TON_WORK_HOST_DIR` to that directory. Choose a path on your mounted data disk
+  to keep node data off the root filesystem.
+- **Docker volume:** asks for a new volume name, suggesting `mytonctrl-ton-work`.
   The wizard leaves `TON_WORK_HOST_DIR` empty and sets `TON_WORK_VOLUME` to the
-  selected name. This uses Docker's volume storage, so check which disk backs it.
+  selected name. It uses `<current-directory>/migration` for deployment files,
+  backups and rollback instructions automatically, without asking for a
+  migration directory. This uses Docker's volume storage for node data, so check
+  which disk backs it.
+
+Compose files are stored in `<migration-directory>/deployment`. If the automatic
+migration directory already contains a previous migration, run the wizard from
+another directory. If the suggested volume already exists, enter a new name.
 
 The wizard rejects nonempty destinations, reused volumes and paths overlapping
 the original data. The migration journal and final output record the selected

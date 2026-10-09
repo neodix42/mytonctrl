@@ -529,7 +529,13 @@ class Wizard:
                          containers[0])
         return self.ask('Existing ton-docker-ctrl container name or ID', preferred['Names'])
 
-    def select_destination(self, mount_sources):
+    def select_destination(self, mount_sources, storage_type='directory'):
+        if storage_type == 'volume':
+            path = Path.cwd() / 'migration'
+            print(f'Migration files (deployment, backup and rollback): {path}')
+            # The data lives in a volume. Prepare local metadata only after the
+            # migration plan is confirmed, without asking for a data-disk path.
+            return ensure_destination_isolated(path, mount_sources, require_parent=False)
         requested = self.ask('New migration directory on the mounted data disk', str(Path.cwd() / 'migration'))
         path = ensure_destination_isolated(requested, mount_sources, require_parent=False)
         if not path.exists():
@@ -551,15 +557,20 @@ class Wizard:
             raise MigrationError('TON work destination contains existing data; choose an empty directory. Existing data was preserved.')
         return path
 
-    def select_work_storage(self, mount_sources):
-        self.source_mounts = list(mount_sources)
+    def select_work_storage_type(self):
         print('TON work storage: directory = custom host path; volume = Docker named volume.')
         while True:
             choice = self.ask('Where should TON work data be copied (directory/volume)?', 'directory').lower()
-            if choice in ('directory', 'volume', '1', '2'):
-                break
+            if choice in ('directory', '1'):
+                return 'directory'
+            if choice in ('volume', '2'):
+                return 'volume'
             print('Enter directory or volume.')
-        if choice in ('directory', '1'):
+
+    def select_work_storage(self, mount_sources, storage_type=None):
+        self.source_mounts = list(mount_sources)
+        storage_type = storage_type or self.select_work_storage_type()
+        if storage_type == 'directory':
             requested = self.ask('TON work host directory (TON_WORK_HOST_DIR)', str(self.root / 'ton-work'))
             self.work_dir = self.validate_work_path(requested)
             docker_volume_storage = (self.docker_root / 'volumes').resolve()
@@ -569,7 +580,7 @@ class Wizard:
                 print('This empty work directory will be created after preparation confirmation.')
             self.settings.update(TON_WORK_HOST_DIR=str(self.work_dir), TON_WORK_VOLUME=self.storage_id + '-unused-work')
         else:
-            name = self.ask('New Docker TON work volume name (must not already exist)', self.storage_id + '-work')
+            name = self.ask('New Docker TON work volume name (must not already exist)', 'mytonctrl-ton-work')
             if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+', name):
                 raise MigrationError('Invalid Docker volume name.')
             if name in (self.storage_id + '-artifacts', self.storage_id + '-scripts'):
@@ -778,19 +789,24 @@ class Wizard:
         active_services = run(['docker', 'exec', self.old_id, 'systemctl', 'list-units', '--type=service', '--state=running', '--no-legend', '--no-pager'])
         if re.search(r'\b(?:ton_storage|ton_http_api|ls_proxy|collator)\.service\b', active_services):
             raise MigrationError('Active auxiliary TON services require a separate migration; source was not stopped.')
-        self.root = self.select_destination([item['Source'] for item in mounts])
-        filesystem = run(['findmnt', '-n', '-o', 'TARGET,SOURCE,FSTYPE', '--target', self.root])
-        print(f'Destination filesystem: {filesystem.strip()}')
         self.docker_root = Path(run(['docker', 'info', '--format', '{{.DockerRootDir}}']).strip())
         if not self.docker_root.is_absolute() or not self.docker_root.is_dir():
             raise MigrationError('Cannot inspect Docker storage on this host for the migration space check.')
         self.docker_volumes, self.docker_writable = docker_storage_paths(inspected, self.docker_root)
-        self.select_work_storage([item['Source'] for item in mounts])
+        storage_type = self.select_work_storage_type()
+        sources = [item['Source'] for item in mounts]
+        self.root = self.select_destination(sources, storage_type)
+        self.select_work_storage(sources, storage_type)
+        work_filesystem_path = self.docker_volumes if self.work_volume else self.work_path
+        while not work_filesystem_path.exists():
+            work_filesystem_path = work_filesystem_path.parent
+        filesystem = run(['findmnt', '-n', '-o', 'TARGET,SOURCE,FSTYPE', '--target', work_filesystem_path])
+        print(f'TON work filesystem: {filesystem.strip()}')
         self.log_bytes = self.measure_logs()
         self.check_space(probe)
         print('Space includes staging, backup creation/restoration and at least 10% or 1 GiB reserve per storage area.')
-        if filesystem.split()[0] == '/':
-            self.confirm('The destination is on the root filesystem. Use this disk anyway?')
+        if storage_type == 'directory' and filesystem.split()[0] == '/':
+            self.confirm('The TON work destination is on the root filesystem. Use this disk anyway?')
         tag = 'dev' if self.branch == 'dev' else 'latest'
         controller_image = self.image('New MyTonCtrl image', 'ghcr.io/neodix42/mytonctrl:' + tag)
         ton_default = {'x86_64': 'ghcr.io/ton-blockchain/ton:v2026.08-amd64',

@@ -323,7 +323,64 @@ class MigrationFixture(unittest.TestCase):
                 self.assertIn("[directory]", output.getvalue())
                 self.assertIn("[" + str(wizard.root / "ton-work") + "]", output.getvalue())
 
-    def test_named_volume_choice_suggests_unique_name_and_only_lists_volumes_before_consent(self):
+    def test_storage_type_can_be_selected_before_any_destination_is_available(self):
+        for answer, expected in (("\n", "directory"), ("directory\n", "directory"),
+                                 ("1\n", "directory"), ("volume\n", "volume"),
+                                 ("2\n", "volume"), ("invalid\nvolume\n", "volume")):
+            with self.subTest(answer=repr(answer)):
+                wizard = self.wizard.Wizard(tty=io.StringIO(answer))
+                with redirect_stdout(io.StringIO()), mock.patch.object(self.wizard, "run") as run:
+                    self.assertEqual(wizard.select_work_storage_type(), expected)
+                run.assert_not_called()
+                self.assertIsNone(wizard.root)
+                self.assertIsNone(wizard.work_dir)
+                self.assertEqual(wizard.work_volume, "")
+
+    def test_volume_metadata_directory_is_automatic_and_not_created_or_confirmed_during_selection(self):
+        wizard = self.wizard.Wizard(tty=io.StringIO())
+        output = io.StringIO()
+        destination = self.root / "migration"
+        with mock.patch.object(self.wizard.Path, "cwd", return_value=self.root), \
+                mock.patch.object(wizard, "ask") as ask, mock.patch.object(wizard, "confirm") as confirm, \
+                redirect_stdout(output):
+            selected = wizard.select_destination([self.donor], storage_type="volume")
+        self.assertEqual(selected, destination)
+        self.assertFalse(destination.exists())
+        ask.assert_not_called()
+        confirm.assert_not_called()
+        self.assertIn(str(destination), output.getvalue())
+
+    def test_automatic_volume_metadata_directory_refuses_existing_data_without_touching_it(self):
+        before = self.create_legacy_data()
+        destination = self.root / "migration"
+        destination.mkdir()
+        retained = destination / "customer-data"
+        retained.write_bytes(b"must-retain-prior-deployment")
+        previous_mode = stat.S_IMODE(destination.stat().st_mode)
+        wizard = self.wizard.Wizard(tty=io.StringIO())
+        with mock.patch.object(self.wizard.Path, "cwd", return_value=self.root), \
+                mock.patch.object(wizard, "ask") as ask, mock.patch.object(wizard, "confirm") as confirm, \
+                redirect_stdout(io.StringIO()), self.assertRaises(self.wizard.MigrationError):
+            wizard.select_destination([self.donor], storage_type="volume")
+        ask.assert_not_called()
+        confirm.assert_not_called()
+        self.assertEqual(retained.read_bytes(), b"must-retain-prior-deployment")
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), previous_mode)
+        self.assertEqual(file_digests(self.donor), before)
+
+    def test_supplied_storage_type_does_not_repeat_type_question_when_requesting_work_destination(self):
+        for storage in ("directory", "volume"):
+            with self.subTest(storage=storage):
+                wizard = self.wizard.Wizard(tty=io.StringIO("\n"))
+                wizard.root = self.root / "migration"
+                wizard.docker_root = self.root
+                output = io.StringIO()
+                with mock.patch.object(self.wizard, "run", return_value=""), redirect_stdout(output):
+                    wizard.select_work_storage([self.donor], storage_type=storage)
+                self.assertNotIn("Where should TON work data be copied", output.getvalue())
+                self.assertEqual(wizard.work_volume, "mytonctrl-ton-work" if storage == "volume" else "")
+
+    def test_named_volume_choice_suggests_standard_name_and_only_lists_volumes_before_consent(self):
         for answer in ("volume\n\n", "2\n\n", "invalid\nvolume\n\n"):
             with self.subTest(answer=repr(answer)):
                 wizard = self.wizard.Wizard(tty=io.StringIO(answer))
@@ -334,10 +391,10 @@ class MigrationFixture(unittest.TestCase):
                 with redirect_stdout(output), mock.patch.object(self.wizard, "run", return_value="") as run:
                     wizard.select_work_storage([self.donor])
                 run.assert_called_once_with(["docker", "volume", "ls", "--format", "{{.Name}}"])
-                self.assertEqual(wizard.work_volume, wizard.storage_id + "-work")
+                self.assertEqual(wizard.work_volume, "mytonctrl-ton-work")
                 self.assertEqual(wizard.settings["TON_WORK_HOST_DIR"], "")
                 self.assertEqual(wizard.settings["TON_WORK_VOLUME"], wizard.work_volume)
-                self.assertIn("[" + wizard.storage_id + "-work]", output.getvalue())
+                self.assertIn("[mytonctrl-ton-work]", output.getvalue())
                 self.assertIsNone(wizard.work_dir)
 
     def test_invalid_work_volume_name_never_creates_or_lists_any_volume(self):
@@ -769,14 +826,16 @@ class MigrationFixture(unittest.TestCase):
         before = file_digests(self.donor)
         before_modes = {str(path.relative_to(self.donor)): stat.S_IMODE(path.stat().st_mode)
                         for path in self.donor.rglob("*") if not path.is_symlink()}
-        migration = self.root / "automatic-migration"
-        answers = ["", str(migration)]
+        migration = self.root / ("migration" if storage == "volume" else "automatic-migration")
+        answers = ["", storage]
+        if storage == "directory":
+            answers.append(str(migration))
         if existing_env is not None:
             (migration / "deployment").mkdir(parents=True)
             (migration / "deployment/.env").write_bytes(existing_env)
-        else:
+        elif storage == "directory":
             answers.append("no" if fail_at == "directory-cancel" else "yes")
-        answers.extend((storage, str(work_directory or "") if storage == "directory" else work_volume,
+        answers.extend((str(work_directory or "") if storage == "directory" else work_volume,
                         "", "", "yes"))
         if existing_env is not None:
             answers.append(env_consent)
@@ -863,7 +922,7 @@ class MigrationFixture(unittest.TestCase):
                     return json.dumps({"Names": "original-node", "Image": "ton-docker-ctrl:legacy"})
                 return "original-node legacy:image Up"
             if args[:3] == ["docker", "volume", "ls"] and "--filter" not in args:
-                return work_volume if volume_existing else ""
+                return (work_volume or "mytonctrl-ton-work") if volume_existing else ""
             if args[:3] == ["docker", "volume", "create"]:
                 name = args[-1]
                 location = self.root / "volumes" / name / "_data"
@@ -916,6 +975,7 @@ class MigrationFixture(unittest.TestCase):
             if args[:2] == ["docker", "update"]:
                 return ""
             if args[0] == "findmnt":
+                self.assertTrue(Path(args[-1]).exists(), "Filesystem discovery must use an existing ancestor")
                 return "/mnt/data /dev/data ext4"
             if args[:2] == ["docker", "cp"]:
                 if fail_at == "copy":
@@ -960,7 +1020,8 @@ class MigrationFixture(unittest.TestCase):
             return types.SimpleNamespace(free=free)
 
         output = io.StringIO()
-        with mock.patch.object(wizard, "validate_host"), mock.patch.object(wizard, "probe", side_effect=probe), \
+        with mock.patch.object(self.wizard.Path, "cwd", return_value=self.root), \
+                mock.patch.object(wizard, "validate_host"), mock.patch.object(wizard, "probe", side_effect=probe), \
                 mock.patch.object(wizard, "check_ports"), mock.patch.object(self.wizard, "download", side_effect=download), \
                 mock.patch.object(wizard, "measure_logs", return_value=128), \
                 mock.patch.object(self.wizard.shutil, "disk_usage", side_effect=capacity), \
@@ -1189,6 +1250,45 @@ class MigrationFixture(unittest.TestCase):
         self.assertEqual(node_copies[0][-1], str(work))
         self.assertFalse(state["container_running"])
         self.assertFalse(any(call[:3] == ["docker", "volume", "create"] for call in calls))
+
+    def test_directory_workflow_asks_storage_type_before_metadata_and_host_directory(self):
+        wizard, _, state = self.exercise_wizard()
+        output = state["output"]
+        storage = output.index("Where should TON work data be copied")
+        metadata = output.index("New migration directory on the mounted data disk")
+        host = output.index("TON work host directory (TON_WORK_HOST_DIR)")
+        self.assertLess(storage, metadata)
+        self.assertLess(metadata, host)
+        self.assertEqual(output.count("Where should TON work data be copied"), 1)
+        self.assertEqual(wizard.work_volume, "")
+
+    def test_default_volume_workflow_has_no_directory_questions_and_uses_cwd_migration(self):
+        wizard, _, state = self.exercise_wizard(storage="volume")
+        output = state["output"]
+        self.assertEqual(wizard.root, self.root / "migration")
+        self.assertEqual(wizard.work_volume, "mytonctrl-ton-work")
+        self.assertEqual(wizard.work_path, self.root / "volumes/mytonctrl-ton-work/_data")
+        self.assert_work_storage_preserves_node(wizard)
+        self.assertEqual(output.count("Where should TON work data be copied"), 1)
+        self.assertNotIn("New migration directory on the mounted data disk", output)
+        self.assertNotIn("Specified directory does not exist", output)
+        self.assertNotIn("TON work host directory (TON_WORK_HOST_DIR)", output)
+        self.assertIn("[mytonctrl-ton-work]", output)
+        env = self.wizard.parse_env((wizard.root / "deployment/.env").read_text())
+        self.assertEqual(env["TON_WORK_HOST_DIR"], "")
+        self.assertEqual(env["TON_WORK_VOLUME"], "mytonctrl-ton-work")
+
+    def test_existing_default_work_volume_preserves_source_and_creates_no_migration_directory(self):
+        wizard, calls, state = self.exercise_wizard(fail_at="existing-volume", storage="volume", volume_existing=True)
+        self.assertEqual(wizard.root, self.root / "migration")
+        self.assertFalse(wizard.root.exists())
+        self.assertFalse(wizard.donor_stopped)
+        self.assertTrue(state["writer_running"])
+        self.assertTrue(state["container_running"])
+        self.assertFalse(state["pulled"])
+        self.assertEqual(state["volumes"], {})
+        self.assertFalse(any(call[:3] == ["docker", "volume", "create"] or call[:2] == ["docker", "cp"]
+                             or call[:2] == ["docker", "stop"] for call in calls))
 
     def test_named_work_volume_copies_directly_preserves_all_data_and_is_external_to_compose(self):
         name = "selected-node-work"
