@@ -151,18 +151,19 @@ For the dev version, download from `dev` and run `sudo bash migrate.sh --branch 
 Use `bash migrate.sh --help` for options. Download the script before running it;
 the wizard needs an interactive terminal for its questions and confirmations.
 
-Before proceeding, take an independent backup or storage snapshot. Prepare a
-mounted data disk with enough free space for a **complete additional copy** of
-the old node; archive databases can require many terabytes. The destination must
-be separate from all of the old installation's data directories. Keep the old
-container, image, volumes and deployment files until migration is verified.
+Before proceeding, take an independent backup or storage snapshot. The selected
+destination needs enough free space for a **complete additional copy** of the old
+node; archive databases can require many terabytes. It must be separate from all
+of the old installation's data directories. Keep the old container, image,
+volumes and deployment files until migration is verified.
 
-The wizard checks the space for the whole migration: the full data and legacy
-controller copies, identity staging, backup archive, controller import and
-temporary backup extraction. It measures the TON artifacts and checks Docker
-storage for the exported binaries and their running snapshot, including separate
-volume or writable-layer mounts. If storage locations share a filesystem, it
-adds their requirements together. Estimates
+The wizard checks the migration metadata directory, the selected TON work
+storage and Docker storage separately. Its budget includes the full data copy,
+legacy controller copy, identity staging, backup archive, controller import,
+temporary backup extraction, exported TON binaries and their running snapshot.
+It copies node data directly into the selected storage, without another staging
+copy of the database. If storage locations share a filesystem, it adds their
+requirements together. Estimates
 assume no compression or sparse-file savings and retain at least 10% or 1 GiB
 of extra space per storage area for metadata, logs and initial growth.
 Images are pulled while the old node is running; the wizard checks the remaining
@@ -175,14 +176,24 @@ space as the migrated node syncs and its database grows.
 
 The wizard identifies the old container and asks you to review its network,
 node mode, advertised IP, ports, retention settings and replacement images. It
-asks for a dedicated destination on your data disk, creates its deployment
-directory automatically, and requests confirmation before stopping the old
-node and before starting the replacement.
+asks where to store migration files and node data, then requests confirmation
+before stopping the old node and before starting the replacement.
 
-The suggested migration directory is `<current-directory>/migration`. You can
-choose another empty directory on your mounted data disk. Compose files are
-stored in its `deployment` subdirectory; the copied node data is in `ton-work`.
-The Compose project and controller container are both named `mytonctrl`.
+The suggested migration directory is `<current-directory>/migration`. Compose
+files are stored in its `deployment` subdirectory. Node storage is a separate
+choice:
+
+- **Host directory (default):** accepts a custom absolute path, with
+  `<migration-directory>/ton-work` suggested. The wizard sets `TON_WORK_HOST_DIR`
+  to that directory. Choose a path on your mounted data disk to keep node data
+  off the root filesystem.
+- **Docker volume:** creates a new named volume, suggesting an unused name.
+  The wizard leaves `TON_WORK_HOST_DIR` empty and sets `TON_WORK_VOLUME` to the
+  selected name. This uses Docker's volume storage, so check which disk backs it.
+
+The wizard rejects nonempty destinations, reused volumes and paths overlapping
+the original data. The migration journal and final output record the selected
+storage. The Compose project and controller container are both named `mytonctrl`.
 The wizard stops if that container name or project already exists, preserving
 the existing deployment. Artifact volumes still have independent names.
 
@@ -196,8 +207,9 @@ It then:
 1. Disables the old container's
    [automatic restart](https://docs.docker.com/engine/containers/start-containers-automatically/),
    then stops its controller and validator before taking the copy.
-2. Copies the entire TON work directory, controller state, wallets, private keys,
-   console settings and network configuration into separate storage.
+2. Copies the entire TON work directory directly to the chosen host directory or
+   Docker volume, and saves controller state, wallets, private keys, console
+   settings and network configuration for import.
 3. Downloads this repository's `.env.example` and Compose file, configures the
    new deployment, and imports the saved identities and controller settings.
 4. Checks the backup, configuration and copied key files, then starts the new
@@ -272,6 +284,12 @@ stake and wallet state before resuming the old controller.
 
 Do not use `docker compose down -v`, prune volumes or delete the old data during
 migration. The wizard never deletes the source installation automatically.
+The new migration data volume is marked external in the migration override, so
+Compose [does not remove it with `down -v`](https://docs.docker.com/reference/cli/docker/compose/down/);
+a host directory also stays intact.
+To deliberately remove migrated volume data, stop and remove the replacement
+container first, retain an independent backup, then run
+`sudo docker volume rm <selected-TON_WORK_VOLUME>`.
 
 ## Installation arguments in .env
 

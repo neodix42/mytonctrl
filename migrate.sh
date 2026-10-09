@@ -58,7 +58,7 @@ def parse_env(text):
     return result
 
 
-def ensure_destination_isolated(path, mount_sources, require_parent=True):
+def ensure_destination_isolated(path, mount_sources, require_parent=True, allow_data=False):
     path = Path(path).expanduser()
     if not path.is_absolute() or re.search(r'[\s,$:#\x00-\x1f]', str(path)):
         raise MigrationError('Choose an absolute destination without whitespace or Compose metacharacters.')
@@ -76,7 +76,9 @@ def ensure_destination_isolated(path, mount_sources, require_parent=True):
         source = Path(source).resolve()
         if path == source or source in path.parents or path in source.parents:
             raise MigrationError(f'Destination overlaps donor storage: {source}')
-    if path.exists():
+    if path.exists() and not path.is_dir():
+        raise MigrationError('Destination must be a directory; existing data was preserved.')
+    if path.exists() and not allow_data:
         # A prepared .env is allowed, but never reuse node data or a prior migration.
         if not path.is_dir() or {item.name for item in path.iterdir()} - {'deployment'}:
             raise MigrationError('Destination contains existing data; choose a new directory. Existing data was preserved.')
@@ -362,9 +364,15 @@ def migration_space_plan(probe, log_bytes=0, block_size=4096):
             'archive': archive_bytes, 'prime': core_bytes,
             'startup': core_bytes,  # Installer also retains mytoncore.db.backup.
             'restore': identity_bytes}
+    node_copy = probe['copy_totals']['ton-work']
+    plan['work_copy'] = node_copy['bytes'] + 2 * node_copy['entries'] * block_size
+    plan['work_stage'] = stored_files(console) + probe['config_bytes']
+    work_peak = plan['work_copy'] + plan['work_stage'] + plan['prime'] + plan['startup']
     peak = sum(plan[name] for name in ('copy', 'stage', 'archive', 'prime', 'startup'))
     # Keep the original reserve at later checkpoints, including initial node growth.
     plan['reserve'] = max(2**30, (peak + 9) // 10)
+    plan['work_reserve'] = max(2**30, (work_peak + 9) // 10)
+    plan['metadata_reserve'] = max(2**30, (peak - work_peak + 9) // 10)
     return plan
 
 
@@ -488,6 +496,15 @@ class Wizard:
         self.docker_writable = None
         self.artifact_bytes = 0
         self.log_bytes = 0
+        self.work_dir = None
+        self.work_volume = ''
+        self.source_mounts = []
+        self.storage_id = 'mytonctrl-' + time.strftime('%Y%m%d%H%M%S') + '-' + str(os.getpid())
+        self.volume_token = os.urandom(16).hex()
+
+    @property
+    def work_path(self):
+        return self.work_dir or self.root / 'ton-work'
 
     def ask(self, title, default=None):
         suffix = f' [{default}]' if default is not None else ''
@@ -525,6 +542,82 @@ class Wizard:
     def compose_run(self, args, capture=False):
         return run(self.compose + args, capture=capture, env=self.compose_env)
 
+    def validate_work_path(self, path, require_empty=True):
+        path = ensure_destination_isolated(path, self.source_mounts, require_parent=False, allow_data=True)
+        root = self.root.resolve()
+        if path != root / 'ton-work' and (path == root or root in path.parents or path in root.parents):
+            raise MigrationError('TON work storage overlaps migration metadata; choose a separate directory.')
+        if require_empty and path.exists() and any(path.iterdir()):
+            raise MigrationError('TON work destination contains existing data; choose an empty directory. Existing data was preserved.')
+        return path
+
+    def select_work_storage(self, mount_sources):
+        self.source_mounts = list(mount_sources)
+        print('TON work storage: directory = custom host path; volume = Docker named volume.')
+        while True:
+            choice = self.ask('Where should TON work data be copied (directory/volume)?', 'directory').lower()
+            if choice in ('directory', 'volume', '1', '2'):
+                break
+            print('Enter directory or volume.')
+        if choice in ('directory', '1'):
+            requested = self.ask('TON work host directory (TON_WORK_HOST_DIR)', str(self.root / 'ton-work'))
+            self.work_dir = self.validate_work_path(requested)
+            docker_volume_storage = (self.docker_root / 'volumes').resolve()
+            if self.work_dir == docker_volume_storage or docker_volume_storage in self.work_dir.parents:
+                raise MigrationError('Choose a host directory outside Docker volume storage, or select the Docker volume option.')
+            if not self.work_dir.exists():
+                print('This empty work directory will be created after preparation confirmation.')
+            self.settings.update(TON_WORK_HOST_DIR=str(self.work_dir), TON_WORK_VOLUME=self.storage_id + '-unused-work')
+        else:
+            name = self.ask('New Docker TON work volume name (must not already exist)', self.storage_id + '-work')
+            if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+', name):
+                raise MigrationError('Invalid Docker volume name.')
+            if name in (self.storage_id + '-artifacts', self.storage_id + '-scripts'):
+                raise MigrationError('TON work, artifact and script volume names must be different; choose another work volume name.')
+            if name in run(['docker', 'volume', 'ls', '--format', '{{.Name}}']).splitlines():
+                raise MigrationError('TON work volume already exists; choose a new name. Existing volume was preserved.')
+            self.validate_work_path(self.docker_root / 'volumes' / name / '_data')
+            self.work_volume = name
+            self.settings.update(TON_WORK_HOST_DIR='', TON_WORK_VOLUME=name)
+            print(f'TON data will be copied into Docker volume {name}, stored on Docker\'s volume filesystem.')
+
+    def validate_work_storage(self, require_empty=False):
+        if self.work_volume:
+            records = json.loads(run(['docker', 'volume', 'inspect', self.work_volume]))
+            if len(records) != 1:
+                raise MigrationError('Cannot inspect the migration work volume.')
+            volume = records[0]
+            if (volume.get('Name') != self.work_volume or volume.get('Driver') != 'local'
+                    or volume.get('Scope') != 'local' or volume.get('Options')
+                    or (volume.get('Labels') or {}).get('mytonctrl.migration') != self.volume_token):
+                raise MigrationError('Work volume ownership or storage changed; existing data was preserved.')
+            mountpoint = Path(volume.get('Mountpoint', ''))
+            expected = self.docker_root.resolve() / 'volumes' / self.work_volume / '_data'
+            if (not mountpoint.is_absolute() or mountpoint.is_symlink() or not mountpoint.is_dir()
+                    or mountpoint.resolve() != expected):
+                raise MigrationError('Cannot safely access the local Docker work volume mountpoint.')
+            if run(['docker', 'container', 'ls', '--all', '--filter', 'volume=' + self.work_volume, '--format', '{{.ID}}']).strip():
+                raise MigrationError('The migration work volume is already attached to a container; existing data was preserved.')
+            path = self.validate_work_path(mountpoint, require_empty)
+            if self.work_dir is not None and path != self.work_dir:
+                raise MigrationError('TON work volume mountpoint changed; migration stopped.')
+            self.work_dir = path
+        elif self.validate_work_path(self.work_path, require_empty) != self.work_path:
+            raise MigrationError('TON work directory changed; migration stopped.')
+
+    def prepare_work_storage(self):
+        if self.work_volume:
+            if self.work_volume in run(['docker', 'volume', 'ls', '--format', '{{.Name}}']).splitlines():
+                raise MigrationError('TON work volume appeared during planning; existing volume was preserved.')
+            self.validate_work_path(self.docker_root / 'volumes' / self.work_volume / '_data')
+            run(['docker', 'volume', 'create', '--driver', 'local', '--label',
+                 'mytonctrl.migration=' + self.volume_token, self.work_volume])
+            self.validate_work_storage(require_empty=True)
+        else:
+            self.validate_work_storage(require_empty=True)
+            self.work_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.journal('prepared')
+
     def check_deployment_available(self):
         # Fixed names must never attach this migration to another deployment.
         label = 'label=com.docker.compose.project=' + self.project
@@ -542,7 +635,10 @@ class Wizard:
         if self.root and self.root.is_dir() and (phase == 'prepared' or (self.root / 'migration.json').is_file()):
             temporary = self.root / 'migration.json.tmp'
             temporary.write_text(json.dumps({'phase': phase, 'old_container': self.old_id,
-                                             'project': self.project, 'settings': self.settings}, indent=2))
+                                             'project': self.project, 'settings': self.settings,
+                                             'work_storage': {'type': 'volume' if self.work_volume else 'directory',
+                                                              'path': str(self.work_dir) if self.work_dir else None,
+                                                              'volume': self.work_volume}}, indent=2))
             temporary.replace(self.root / 'migration.json')
 
     def stop_destination(self):
@@ -556,6 +652,7 @@ class Wizard:
             return
         print('\nThe original container and all of its storage were retained. Both nodes must remain stopped before rollback.')
         print(f'Migration files: {self.root}')
+        print('TON work storage: ' + (f'Docker volume {self.work_volume}' if self.work_volume else str(self.work_path)))
         if self.compose:
             print('Logs: sudo ' + shlex.join(self.compose + ['logs', '--tail', '100']))
             print('Console: sudo ' + shlex.join(self.compose + ['exec', 'mytonctrl', 'mytonctrl']))
@@ -603,10 +700,16 @@ class Wizard:
         destination = self.root if self.root.exists() else self.root.parent
         volumes = self.docker_volumes or self.docker_root
         writable = self.docker_writable or self.docker_root
-        block = max(os.statvfs(path).f_frsize for path in (destination, volumes, writable))
+        work = self.work_dir or (volumes if self.work_volume else self.work_path)
+        while not work.exists():
+            work = work.parent
+        block = max(os.statvfs(path).f_frsize for path in (destination, work, volumes, writable))
         plan = migration_space_plan(probe, self.log_bytes, block)
         phases = ('copy', 'stage', 'archive', 'prime', 'startup')
         remaining = sum(plan[name] for name in phases[phases.index(phase):])
+        work_phases = {'copy': plan['work_copy'], 'stage': plan['work_stage'],
+                       'archive': 0, 'prime': plan['prime'], 'startup': plan['startup']}
+        work_remaining = sum(work_phases[name] for name in phases[phases.index(phase):])
         # Backup extraction in /tmp and the artifact volume plus /run snapshot
         # all live in Docker storage, rather than necessarily on the data disk.
         docker_bytes = plan['restore'] + self.artifact_bytes
@@ -616,7 +719,8 @@ class Wizard:
             # One reserve for Docker allocations sharing a filesystem.
             docker_reserve = max(2**30, (docker_bytes + self.artifact_bytes + 9) // 10)
             artifact_reserve = 0
-        check_disk_space([('migration data', destination, remaining + plan['reserve']),
+        check_disk_space([('migration metadata/backup', destination, remaining - work_remaining + plan['metadata_reserve']),
+                          ('TON work data', work, work_remaining + plan['work_reserve']),
                           ('Docker restore/snapshot', writable, docker_bytes + docker_reserve),
                           ('Docker artifact volumes', volumes, self.artifact_bytes + artifact_reserve)])
 
@@ -681,6 +785,7 @@ class Wizard:
         if not self.docker_root.is_absolute() or not self.docker_root.is_dir():
             raise MigrationError('Cannot inspect Docker storage on this host for the migration space check.')
         self.docker_volumes, self.docker_writable = docker_storage_paths(inspected, self.docker_root)
+        self.select_work_storage([item['Source'] for item in mounts])
         self.log_bytes = self.measure_logs()
         self.check_space(probe)
         print('Space includes staging, backup creation/restoration and at least 10% or 1 GiB reserve per storage area.')
@@ -693,11 +798,8 @@ class Wizard:
                        'aarch64': 'ghcr.io/ton-blockchain/ton:v2026.08-arm64',
                        'arm64': 'ghcr.io/ton-blockchain/ton:v2026.08-arm64'}.get(platform.machine().lower())
         ton_image = self.image('Official TON image (choose a compatible tag for this host; upgrade separately)', ton_default)
-        storage = 'mytonctrl-' + time.strftime('%Y%m%d%H%M%S') + '-' + str(os.getpid())
         self.settings.update(MYTONCTRL_IMAGE=controller_image, TON_IMAGE=ton_image,
-                             TON_WORK_HOST_DIR=str(self.root / 'ton-work'),
-                             TON_ARTIFACTS_VOLUME=storage + '-artifacts', TON_SCRIPTS_VOLUME=storage + '-scripts',
-                             TON_WORK_VOLUME=storage + '-unused-work')
+                             TON_ARTIFACTS_VOLUME=self.storage_id + '-artifacts', TON_SCRIPTS_VOLUME=self.storage_id + '-scripts')
         # Restoring an existing collator must not invoke SetupCollator, which
         # creates another ADNL key/registration even when a backup is supplied.
         install_mode = 'none' if self.settings['MODE'] == 'collator' else self.settings['MODE']
@@ -709,7 +811,7 @@ class Wizard:
         template = download(base + '/.env.example').decode()
         compose = download(base + '/docker/compose.yml').decode()
         print('\nMigration plan:')
-        for key in ('NETWORK', 'MODE', 'PUBLIC_IP', 'VALIDATOR_PORT', 'QUIC_PORT', 'VALIDATOR_CONSOLE_PORT', 'LITESERVER_PORT', 'ARCHIVE_TTL', 'STATE_TTL', 'MYTONCTRL_IMAGE', 'TON_IMAGE'):
+        for key in ('NETWORK', 'MODE', 'PUBLIC_IP', 'VALIDATOR_PORT', 'QUIC_PORT', 'VALIDATOR_CONSOLE_PORT', 'LITESERVER_PORT', 'ARCHIVE_TTL', 'STATE_TTL', 'MYTONCTRL_IMAGE', 'TON_IMAGE', 'TON_WORK_HOST_DIR', 'TON_WORK_VOLUME'):
             print(f'  {key}={self.settings[key]}')
         print('  Enabled controller modes: ' + ', '.join(name for name, enabled in probe['core']['modes'].items() if enabled))
         if self.settings['MODE'] == 'collator':
@@ -728,6 +830,8 @@ class Wizard:
         (self.root / 'legacy/validator-command.json').write_text(json.dumps(probe['command']))
         self.write_rollback()
         self.journal('prepared')
+        self.prepare_work_storage()
+        self.check_space(probe)
         self.compose_run(['config', '--quiet'], capture=True)
         self.compose_run(['pull'])
         run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--workdir', '/tmp',
@@ -747,6 +851,7 @@ class Wizard:
         self.log_bytes = self.measure_logs()
         self.check_space(self.probe())
         self.check_deployment_available()
+        self.validate_work_storage(require_empty=True)
         # Once stopping begins, errors leave the donor stopped; restarting is an explicit rollback.
         self.donor_stopped = True
         self.journal('stopping-donor')
@@ -773,6 +878,7 @@ class Wizard:
             raise MigrationError('The donor container is still running.')
         self.log_bytes = self.measure_logs()
         self.check_space(offline)
+        self.validate_work_storage(require_empty=True)
         self.journal('copying')
         print('Copying stopped node data. This can take hours for an archive; keep this terminal open.')
         self.copy_data(offline)
@@ -785,18 +891,19 @@ class Wizard:
         run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--workdir', '/tmp',
              '--entrypoint', '/opt/mytonctrl/venv/bin/python', '--mount', f'type=bind,src={backup},dst=/migration/backup.tar.gz,readonly',
              controller_image, '-c', 'import sys; from pathlib import Path; sys.path.insert(0,"/usr/local/lib/mytonctrl"); from entrypoint import check_backup; check_backup(Path("/migration/backup.tar.gz"))'])
-        copy_controller(self.root / 'identity/mytoncore', self.root / 'ton-work/controller/mytoncore')
-        verify_keys(self.root / 'ton-work', hashes)
+        copy_controller(self.root / 'identity/mytoncore', self.work_path / 'controller/mytoncore')
+        verify_keys(self.work_path, hashes)
         self.check_ports()
         self.journal('copied-and-validated')
         self.confirm('Offline copy and keys verified. Start the new node now?')
         self.check_space(offline, phase='startup')
         self.check_deployment_available()
+        self.validate_work_storage()
         self.destination_attempted = True
         self.journal('starting-destination')
         self.compose_run(['up', '-d', '--no-build', '--pull', 'never'])
         print('Waiting up to 15 minutes for controller initialization; dump data will not be downloaded again.')
-        marker = self.root / 'ton-work/controller/initialized.json'
+        marker = self.work_path / 'controller/initialized.json'
         deadline = time.monotonic() + 900
         while not marker.is_file():
             if time.monotonic() >= deadline:
@@ -875,6 +982,9 @@ class Wizard:
                                               'volumes': [{'type': 'bind', 'source': str(self.root / 'backup.tar.gz'),
                                                           'target': '/migration/backup.tar.gz', 'read_only': True,
                                                           'bind': {'create_host_path': False}}]}}}
+        if self.work_volume:
+            # Created explicitly for this migration; preserve it on Compose down -v.
+            override['volumes'] = {'ton-work': {'external': True, 'name': self.work_volume}}
         (deployment / 'migration.override.json').write_text(json.dumps(override, indent=2))
         self.compose = ['docker', 'compose', '--project-name', self.project, '--env-file', str(deployment / '.env'),
                         '-f', str(deployment / 'compose.yml'), '-f', str(deployment / 'migration.override.json')]
@@ -896,8 +1006,8 @@ class Wizard:
     def copy_data(self, offline):
         for name, source in (('ton-work', '/var/ton-work'), ('legacy/mytoncore', '/usr/local/bin/mytoncore'),
                               ('legacy/mytonctrl', '/usr/local/bin/mytonctrl')):
-            target = self.root / name
-            target.mkdir()
+            target = self.work_path if name == 'ton-work' else self.root / name
+            target.mkdir(exist_ok=name == 'ton-work')
             run(['docker', 'cp', '-a', self.old_id + ':' + source + '/.', target], capture=False)
         runtime = self.root / 'legacy/ton-runtime'
         runtime.mkdir()
@@ -907,23 +1017,23 @@ class Wizard:
             subprocess.run(['docker', 'logs', '--timestamps', self.old_id], stdout=output, stderr=subprocess.STDOUT, check=True)
         for key, size in offline['sizes'].items():
             if key.startswith('ton-work/'):
-                target = self.root / key
+                target = self.work_path / key[len('ton-work/'):]
             else:
                 target = self.root / 'legacy' / key
             if target.is_symlink() or not target.is_file() or target.stat().st_size != size:
                 raise MigrationError(f'Offline copy inventory mismatch: {key}')
         for key, expected in offline['hashes'].items():
-            target = self.root / key if key.startswith('ton-work/') else self.root / 'legacy' / key
+            target = self.work_path / key[len('ton-work/'):] if key.startswith('ton-work/') else self.root / 'legacy' / key
             if hashlib.sha256(target.read_bytes()).hexdigest() != expected:
                 raise MigrationError(f'Offline key/wallet checksum mismatch: {key}')
         for key in offline['log_links']:
-            path = self.root / key
+            path = self.work_path / key[len('ton-work/'):]
             if path.is_symlink():
                 path.unlink()  # Only the independent destination; original stdout saved above.
         (self.root / 'offline-inventory.json').write_text(json.dumps(offline['sizes'], indent=2))
 
     def stage_import(self):
-        work = self.root / 'ton-work'
+        work = self.work_path
         if (work / 'controller').exists():
             raise MigrationError('Existing container migration markers detected; use the appropriate recovery procedure.')
         list(safe_files(work))
@@ -962,8 +1072,8 @@ class Wizard:
                             raise MigrationError(f'{name} is already occupied; keep the donor stopped and review the conflicting process.') from error
 
     def verify_runtime(self, hashes, original):
-        verify_keys(self.root / 'ton-work', hashes)
-        core = json.loads((self.root / 'ton-work/controller/mytoncore/mytoncore.db').read_text())
+        verify_keys(self.work_path, hashes)
+        core = json.loads((self.work_path / 'controller/mytoncore/mytoncore.db').read_text())
         for field in ('validatorWalletName', 'adnlAddr'):
             if core.get(field) != original['core'].get(field):
                 raise MigrationError(f'Saved {field} changed; the destination was stopped for review.')
@@ -975,7 +1085,7 @@ class Wizard:
                 raise MigrationError('Unexpected node modes were enabled; destination stopped for review.')
         elif old_modes != new_modes:
             raise MigrationError('Saved node modes changed; destination stopped for review.')
-        node = json.loads((self.root / 'ton-work/db/config.json').read_text())
+        node = json.loads((self.work_path / 'db/config.json').read_text())
         node_fields = {'fullnode', 'control', 'liteservers', 'addrs', 'collators'}
         node_fields.update(field for field in set(node) | set(original['node']) if 'collator' in field.lower())
         for field in sorted(node_fields):
