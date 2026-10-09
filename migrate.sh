@@ -55,12 +55,19 @@ def parse_env(text):
     return result
 
 
-def ensure_destination_isolated(path, mount_sources):
+def ensure_destination_isolated(path, mount_sources, require_parent=True):
     path = Path(path).expanduser()
     if not path.is_absolute() or re.search(r'[\s,$:#\x00-\x1f]', str(path)):
         raise MigrationError('Choose an absolute destination without whitespace or Compose metacharacters.')
     if path.is_symlink():
         raise MigrationError('The migration destination must be a real directory, not a symlink.')
+    ancestor = path.parent
+    while not ancestor.exists():
+        if ancestor.is_symlink():
+            raise MigrationError(f'Destination parent is an unresolved symlink: {ancestor}')
+        ancestor = ancestor.parent
+    if not ancestor.is_dir():
+        raise MigrationError(f'Destination parent is not a directory: {ancestor}')
     path = path.resolve()
     for source in mount_sources:
         source = Path(source).resolve()
@@ -78,7 +85,7 @@ def ensure_destination_isolated(path, mount_sources):
             if env_path.exists() or env_path.is_symlink():
                 if env_path.is_symlink() or not env_path.is_file() or env_path.stat().st_nlink != 1:
                     raise MigrationError('Existing .env must be a regular file without links.')
-    if not path.parent.is_dir():
+    if require_parent and not path.parent.is_dir():
         raise MigrationError('Mount the destination disk and create its parent directory first.')
     return path
 
@@ -479,6 +486,27 @@ class Wizard:
         if self.ask(message + ' (type yes to continue)', 'no').lower() != 'yes':
             raise MigrationError('Cancelled. Existing data was preserved.')
 
+    def select_container(self):
+        print(run(['docker', 'ps', '--format', 'table {{.Names}}\t{{.Image}}\t{{.Status}}']))
+        containers = [json.loads(line) for line in run(['docker', 'ps', '--format', '{{json .}}']).splitlines()
+                      if line.strip()]
+        containers = [container for container in containers if container.get('Names')]
+        if not containers:
+            raise MigrationError('No running containers found. Start the original ton-docker-ctrl node before migration.')
+        preferred = next((container for container in containers if 'ton-docker-ctrl' in container.get('Image', '')),
+                         containers[0])
+        return self.ask('Existing ton-docker-ctrl container name or ID', preferred['Names'])
+
+    def select_destination(self, mount_sources):
+        requested = self.ask('New migration directory on the mounted data disk', '/mnt/ton/mytonctrl-migration')
+        path = ensure_destination_isolated(requested, mount_sources, require_parent=False)
+        if not path.exists():
+            self.confirm(f'Specified directory does not exist: {path}. Create it (including missing parents)?')
+            if ensure_destination_isolated(requested, mount_sources, require_parent=False) != path:
+                raise MigrationError('Destination changed during confirmation; no directory was created.')
+            path.mkdir(mode=0o700, parents=True)
+        return ensure_destination_isolated(path, mount_sources)
+
     def compose_run(self, args, capture=False):
         return run(self.compose + args, capture=capture, env=self.compose_env)
 
@@ -563,8 +591,7 @@ class Wizard:
     def execute(self):
         self.validate_host()
         print('MyTonCtrl migration wizard: same-host, offline copy; original data is never removed.\n')
-        print(run(['docker', 'ps', '--format', 'table {{.Names}}\t{{.Image}}\t{{.Status}}']))
-        old_name = self.ask('Existing ton-docker-ctrl container name or ID')
+        old_name = self.select_container()
         inspected = json.loads(run(['docker', 'inspect', old_name]))[0]
         self.old_id = inspected['Id']
         restart = inspected.get('HostConfig', {}).get('RestartPolicy', {})
@@ -614,9 +641,8 @@ class Wizard:
         active_services = run(['docker', 'exec', self.old_id, 'systemctl', 'list-units', '--type=service', '--state=running', '--no-legend', '--no-pager'])
         if re.search(r'\b(?:ton_storage|ton_http_api|ls_proxy|collator)\.service\b', active_services):
             raise MigrationError('Active auxiliary TON services require a separate migration; source was not stopped.')
-        parent = Path(self.ask('New migration directory on the mounted data disk', '/mnt/ton/mytonctrl-migration'))
-        self.root = ensure_destination_isolated(parent, [item['Source'] for item in mounts])
-        filesystem = run(['findmnt', '-n', '-o', 'TARGET,SOURCE,FSTYPE', '--target', self.root.parent])
+        self.root = self.select_destination([item['Source'] for item in mounts])
+        filesystem = run(['findmnt', '-n', '-o', 'TARGET,SOURCE,FSTYPE', '--target', self.root])
         print(f'Destination filesystem: {filesystem.strip()}')
         self.docker_root = Path(run(['docker', 'info', '--format', '{{.DockerRootDir}}']).strip())
         if not self.docker_root.is_absolute() or not self.docker_root.is_dir():
@@ -629,7 +655,10 @@ class Wizard:
             self.confirm('The destination is on the root filesystem. Use this disk anyway?')
         tag = 'dev' if self.branch == 'dev' else 'latest'
         controller_image = self.image('New MyTonCtrl image', 'ghcr.io/neodix42/mytonctrl:' + tag)
-        ton_default = 'ghcr.io/ton-blockchain/ton:v2026.08-amd64' if platform.machine() == 'x86_64' else None
+        ton_default = {'x86_64': 'ghcr.io/ton-blockchain/ton:v2026.08-amd64',
+                       'amd64': 'ghcr.io/ton-blockchain/ton:v2026.08-amd64',
+                       'aarch64': 'ghcr.io/ton-blockchain/ton:v2026.08-arm64',
+                       'arm64': 'ghcr.io/ton-blockchain/ton:v2026.08-arm64'}.get(platform.machine().lower())
         ton_image = self.image('Official TON image (choose a compatible tag for this host; upgrade separately)', ton_default)
         self.project = 'mytonctrl-migrated-' + time.strftime('%Y%m%d%H%M%S') + '-' + str(os.getpid())
         self.settings.update(MYTONCTRL_IMAGE=controller_image, TON_IMAGE=ton_image,

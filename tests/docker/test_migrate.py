@@ -155,6 +155,152 @@ class MigrationFixture(unittest.TestCase):
         self.assertEqual(self.wizard.ensure_destination_isolated(isolated, [str(source)]), isolated.resolve())
         self.assertFalse(isolated.exists(), "The guard must not create destination directories")
 
+    def test_container_selection_suggests_the_first_legacy_node_or_running_container(self):
+        cases = (
+            ([{"Names": "legacy-node", "Image": "ghcr.io/ton-blockchain/ton-docker-ctrl:mainnet"}],
+             "\n", "legacy-node"),
+            ([{"Names": "gton", "Image": "gton:latest"},
+              {"Names": "first-legacy", "Image": "ton-docker-ctrl:testnet"},
+              {"Names": "second-legacy", "Image": "ton-docker-ctrl:mainnet"}],
+             "\n", "first-legacy"),
+            ([{"Names": "first-running", "Image": "custom-ton:latest"},
+              {"Names": "second-running", "Image": "another-node:latest"}],
+             "\n", "first-running"),
+            ([{"Names": "suggested-node", "Image": "ton-docker-ctrl:mainnet"}],
+             "manually-selected-node\n", "manually-selected-node"),
+        )
+        for records, answer, expected in cases:
+            with self.subTest(containers=records, answer=repr(answer)):
+                wizard = self.wizard.Wizard(tty=io.StringIO(answer))
+                table = "NAMES  IMAGE  STATUS\nCurrent running container table\n"
+
+                def ps(args):
+                    self.assertEqual(args[:2], ["docker", "ps"])
+                    return "\n".join(json.dumps(record) for record in records) if args[-1] == "{{json .}}" else table
+
+                output = io.StringIO()
+                with mock.patch.object(self.wizard, "run", side_effect=ps), redirect_stdout(output):
+                    selected = wizard.select_container()
+                self.assertEqual(selected, expected)
+                self.assertIn(table, output.getvalue())
+                suggested = next((item["Names"] for item in records if "ton-docker-ctrl" in item["Image"]), records[0]["Names"])
+                self.assertIn("[" + suggested + "]", output.getvalue())
+
+    def test_no_running_containers_fail_before_asking_for_a_donor(self):
+        wizard = self.wizard.Wizard(tty=io.StringIO("unused-answer\n"))
+
+        def ps(args):
+            return "" if args[-1] == "{{json .}}" else "NAMES  IMAGE  STATUS\n"
+
+        with mock.patch.object(self.wizard, "run", side_effect=ps), mock.patch.object(wizard, "ask") as ask, \
+                redirect_stdout(io.StringIO()), self.assertRaises(self.wizard.MigrationError):
+            wizard.select_container()
+        ask.assert_not_called()
+
+    def test_missing_destination_parents_can_be_validated_without_creating_them(self):
+        destination = self.root / "new-storage" / "customer" / "migration"
+        self.assertEqual(self.wizard.ensure_destination_isolated(destination, [self.donor], require_parent=False),
+                         destination.resolve())
+        self.assertFalse((self.root / "new-storage").exists())
+        with self.assertRaises(self.wizard.MigrationError):
+            self.wizard.ensure_destination_isolated(destination, [self.donor])
+
+    def test_directory_creation_requires_explicit_yes_and_creates_missing_parents(self):
+        destination = self.root / "new-storage" / "customer" / "migration"
+        wizard = self.wizard.Wizard(tty=io.StringIO(str(destination) + "\nyes\n"))
+        output = io.StringIO()
+        original_confirm = wizard.confirm
+
+        def confirm_before_creating(message):
+            self.assertFalse((self.root / "new-storage").exists(), "No directory may be created before consent")
+            original_confirm(message)
+
+        old_mask = os.umask(0o022)
+        try:
+            with mock.patch.object(wizard, "confirm", side_effect=confirm_before_creating), redirect_stdout(output):
+                selected = wizard.select_destination([self.donor])
+        finally:
+            os.umask(old_mask)
+        self.assertEqual(selected, destination.resolve())
+        self.assertTrue(destination.is_dir())
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o700)
+        self.assertIn("Specified directory does not exist: " + str(destination), output.getvalue())
+        self.assertIn("including missing parents", output.getvalue())
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_declined_default_or_eof_directory_confirmation_creates_nothing(self):
+        for index, answer in enumerate(("no\n", "\n", "")):
+            with self.subTest(answer=repr(answer)):
+                parent = self.root / f"unapproved-storage-{index}"
+                destination = parent / "customer" / "migration"
+                wizard = self.wizard.Wizard(tty=io.StringIO(str(destination) + "\n" + answer))
+                with redirect_stdout(io.StringIO()), self.assertRaises(self.wizard.MigrationError):
+                    wizard.select_destination([self.donor])
+                self.assertFalse(parent.exists())
+
+    def test_invalid_destination_is_rejected_before_any_creation_confirmation(self):
+        occupied = self.root / "occupied"
+        occupied.mkdir()
+        (occupied / "database").write_bytes(b"existing customer data")
+        parent_file = self.root / "not-a-directory"
+        parent_file.write_bytes(b"existing customer file")
+        cases = (self.donor, self.donor / "new-parent" / "migration", self.root,
+                 occupied, parent_file / "migration", self.root / "path with spaces", Path("relative/path"))
+        before = file_digests(self.root)
+        for destination in cases:
+            with self.subTest(destination=destination):
+                wizard = self.wizard.Wizard(tty=io.StringIO(str(destination) + "\nyes\n"))
+                with mock.patch.object(wizard, "confirm", side_effect=self.wizard.MigrationError("Unexpected creation")) as confirm, \
+                        redirect_stdout(io.StringIO()), \
+                        self.assertRaises(self.wizard.MigrationError):
+                    wizard.select_destination([self.donor])
+                confirm.assert_not_called()
+                self.assertEqual(file_digests(self.root), before)
+                self.assertFalse((self.donor / "new-parent").exists())
+                self.assertFalse((self.root / "path with spaces").exists())
+
+    def test_existing_valid_destination_needs_no_creation_prompt_or_permission_change(self):
+        for index, has_env in enumerate((False, True)):
+            with self.subTest(has_env=has_env):
+                destination = self.root / f"existing-{index}"
+                destination.mkdir(mode=0o750)
+                if has_env:
+                    (destination / "deployment").mkdir(mode=0o750)
+                    (destination / "deployment/.env").write_text("EXISTING=preserved\n")
+                before = file_digests(destination)
+                wizard = self.wizard.Wizard(tty=io.StringIO(str(destination) + "\n"))
+                with mock.patch.object(wizard, "confirm") as confirm, redirect_stdout(io.StringIO()):
+                    self.assertEqual(wizard.select_destination([self.donor]), destination.resolve())
+                confirm.assert_not_called()
+                self.assertEqual(file_digests(destination), before)
+                self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o750)
+
+    def test_broken_parent_symlink_is_rejected_before_confirmation_without_creating_its_target(self):
+        missing_target = self.root / "missing-storage-target"
+        parent_link = self.root / "broken-storage-link"
+        parent_link.symlink_to(missing_target, target_is_directory=True)
+        destination = parent_link / "customer" / "migration"
+        wizard = self.wizard.Wizard(tty=io.StringIO(str(destination) + "\nyes\n"))
+        with mock.patch.object(wizard, "confirm", side_effect=self.wizard.MigrationError("Unexpected creation")) as confirm, \
+                redirect_stdout(io.StringIO()), self.assertRaises(self.wizard.MigrationError):
+            wizard.select_destination([self.donor])
+        confirm.assert_not_called()
+        self.assertFalse(missing_target.exists())
+        self.assertTrue(parent_link.is_symlink())
+        self.assertEqual(os.readlink(parent_link), str(missing_target))
+
+    def test_blank_destination_input_uses_the_documented_default(self):
+        existing = self.root / "default-location"
+        existing.mkdir()
+        wizard = self.wizard.Wizard(tty=io.StringIO("\n"))
+        output = io.StringIO()
+        with mock.patch.object(self.wizard, "ensure_destination_isolated", return_value=existing) as guard, \
+                mock.patch.object(wizard, "confirm") as confirm, redirect_stdout(output):
+            self.assertEqual(wizard.select_destination([self.donor]), existing)
+        self.assertEqual(str(guard.call_args_list[0].args[0]), "/mnt/ton/mytonctrl-migration")
+        self.assertIn("[/mnt/ton/mytonctrl-migration]", output.getvalue())
+        confirm.assert_not_called()
+
     def test_testnet_validator_ports_and_finite_retention_are_retained(self):
         service = (
             "[Service]\nExecStart=/usr/bin/ton/validator-engine/validator-engine "
@@ -415,10 +561,14 @@ class MigrationFixture(unittest.TestCase):
         before_modes = {str(path.relative_to(self.donor)): stat.S_IMODE(path.stat().st_mode)
                         for path in self.donor.rglob("*") if not path.is_symlink()}
         migration = self.root / "automatic-migration"
-        answers = ["original-node", str(migration), "", "", "yes"]
+        answers = ["", str(migration)]
         if existing_env is not None:
             (migration / "deployment").mkdir(parents=True)
             (migration / "deployment/.env").write_bytes(existing_env)
+        else:
+            answers.append("no" if fail_at == "directory-cancel" else "yes")
+        answers.extend(("", "", "yes"))
+        if existing_env is not None:
             answers.append(env_consent)
         answers.extend(("yes", "yes"))
         wizard = self.wizard.Wizard(tty=io.StringIO("\n".join(answers) + "\n"))
@@ -490,6 +640,8 @@ class MigrationFixture(unittest.TestCase):
                     return "active\n"
                 return ""
             if args[:2] == ["docker", "ps"]:
+                if args[-1] == "{{json .}}":
+                    return json.dumps({"Names": "original-node", "Image": "ton-docker-ctrl:legacy"})
                 return "original-node legacy:image Up"
             if args[:2] == ["docker", "info"]:
                 self.assertEqual(args[-1], "{{.DockerRootDir}}")
@@ -572,6 +724,38 @@ class MigrationFixture(unittest.TestCase):
         self.assertEqual({str(path.relative_to(self.donor)): stat.S_IMODE(path.stat().st_mode)
                           for path in self.donor.rglob("*") if not path.is_symlink()}, before_modes)
         return wizard, calls, state
+
+    def assert_default_ton_image(self, machine, architecture):
+        with mock.patch.object(self.wizard.platform, "machine", return_value=machine):
+            wizard, _, _ = self.exercise_wizard()
+        expected = "ghcr.io/ton-blockchain/ton:v2026.08-" + architecture
+        env = self.wizard.parse_env((wizard.root / "deployment/.env").read_text())
+        self.assertEqual(wizard.settings["TON_IMAGE"], expected)
+        self.assertEqual(env["TON_IMAGE"], expected)
+        self.assertEqual(json.loads((wizard.root / "migration.json").read_text())["phase"], "verified")
+
+    def test_enter_accepts_amd64_ton_image_on_x86_64(self):
+        self.assert_default_ton_image("x86_64", "amd64")
+
+    def test_enter_accepts_amd64_ton_image_on_amd64(self):
+        self.assert_default_ton_image("AMD64", "amd64")
+
+    def test_enter_accepts_arm64_ton_image_on_aarch64(self):
+        self.assert_default_ton_image("aarch64", "arm64")
+
+    def test_enter_accepts_arm64_ton_image_on_arm64(self):
+        self.assert_default_ton_image("ARM64", "arm64")
+
+    def test_cancelled_directory_creation_does_not_pull_images_or_modify_the_donor(self):
+        wizard, calls, state = self.exercise_wizard(fail_at="directory-cancel")
+        self.assertIsNone(wizard.root)
+        self.assertFalse((self.root / "automatic-migration").exists())
+        self.assertFalse(wizard.donor_stopped)
+        self.assertTrue(state["writer_running"])
+        self.assertTrue(state["container_running"])
+        self.assertFalse(state["pulled"])
+        self.assertFalse(any(call[:2] in (["docker", "stop"], ["docker", "update"], ["docker", "cp"])
+                             or call[-2:-1] == ["stop"] for call in calls))
 
     def test_image_pull_failure_does_not_stop_or_copy_the_original_node(self):
         wizard, calls, state = self.exercise_wizard(fail_at="pull")
