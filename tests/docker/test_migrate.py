@@ -297,11 +297,12 @@ class MigrationFixture(unittest.TestCase):
         existing.mkdir()
         wizard = self.wizard.Wizard(tty=io.StringIO("\n"))
         output = io.StringIO()
-        with mock.patch.object(self.wizard, "ensure_destination_isolated", return_value=existing) as guard, \
+        with mock.patch.object(self.wizard.Path, "cwd", return_value=self.root), \
+                mock.patch.object(self.wizard, "ensure_destination_isolated", return_value=existing) as guard, \
                 mock.patch.object(wizard, "confirm") as confirm, redirect_stdout(output):
             self.assertEqual(wizard.select_destination([self.donor]), existing)
-        self.assertEqual(str(guard.call_args_list[0].args[0]), "/mnt/ton/mytonctrl-migration")
-        self.assertIn("[/mnt/ton/mytonctrl-migration]", output.getvalue())
+        self.assertEqual(Path(guard.call_args_list[0].args[0]), self.root / "migration")
+        self.assertIn("[" + str(self.root / "migration") + "]", output.getvalue())
         confirm.assert_not_called()
 
     def test_testnet_validator_ports_and_finite_retention_are_retained(self):
@@ -641,7 +642,8 @@ class MigrationFixture(unittest.TestCase):
 
     def exercise_wizard(self, fail_at=None, core_update=None, node_update=None, restart_policy=None,
                         existing_env=None, env_consent="yes", legacy_env=None, extra_files=None,
-                        active_services="", runtime_core_update=None, runtime_node_update=None):
+                        active_services="", runtime_core_update=None, runtime_node_update=None,
+                        deployment_collision=None):
         """Run the real workflow, substituting only host tools and image processes."""
         self.create_legacy_data()
         for name, contents in (extra_files or {}).items():
@@ -694,7 +696,8 @@ class MigrationFixture(unittest.TestCase):
             copy_totals[name] = {"bytes": sum(path.lstat().st_size for path in paths
                                               if path.is_file() or path.is_symlink()), "entries": len(paths) + 1}
         config_bytes = sum(path.stat().st_size for path in (self.donor / "ton-runtime").glob("*.config.json"))
-        state = {"writer_running": True, "container_running": True, "probes": 0, "pulled": False}
+        state = {"writer_running": True, "container_running": True, "probes": 0,
+                 "pulled": False, "deployment_checks": 0}
         calls = []
 
         def probe():
@@ -748,6 +751,23 @@ class MigrationFixture(unittest.TestCase):
                 if args[-1] == "{{json .}}":
                     return json.dumps({"Names": "original-node", "Image": "ton-docker-ctrl:legacy"})
                 return "original-node legacy:image Up"
+            if args[:3] in (["docker", "container", "ls"], ["docker", "network", "ls"],
+                            ["docker", "volume", "ls"]):
+                is_name = "name=^/mytonctrl$" in args
+                expected = ["docker", args[1], "ls"]
+                if args[1] == "container":
+                    expected.append("--all")
+                expected.extend(("--filter", "name=^/mytonctrl$" if is_name else
+                                 "label=com.docker.compose.project=mytonctrl", "--format",
+                                 "{{.ID}}" if args[1] == "container" else "{{.Name}}"))
+                self.assertEqual(args, expected)
+                collision = "name" if is_name else args[1]
+                if is_name:
+                    state["deployment_checks"] += 1
+                requested_collision, requested_check = (deployment_collision if isinstance(deployment_collision, tuple)
+                                                        else (deployment_collision, 1))
+                return ("existing-resource" if requested_collision == collision
+                        and state["deployment_checks"] == requested_check else "")
             if args[:2] == ["docker", "info"]:
                 self.assertEqual(args[-1], "{{.DockerRootDir}}")
                 return str(self.root)
@@ -810,13 +830,14 @@ class MigrationFixture(unittest.TestCase):
                 free = 0
             return types.SimpleNamespace(free=free)
 
+        output = io.StringIO()
         with mock.patch.object(wizard, "validate_host"), mock.patch.object(wizard, "probe", side_effect=probe), \
                 mock.patch.object(wizard, "check_ports"), mock.patch.object(self.wizard, "download", side_effect=download), \
                 mock.patch.object(wizard, "measure_logs", return_value=128), \
                 mock.patch.object(self.wizard.shutil, "disk_usage", side_effect=capacity), \
                 mock.patch.object(self.wizard, "run", side_effect=run), \
                 mock.patch.object(self.wizard.time, "sleep", side_effect=AssertionError("Unexpected service wait")), \
-                mock.patch.object(self.wizard.subprocess, "run", side_effect=logs), redirect_stdout(io.StringIO()):
+                mock.patch.object(self.wizard.subprocess, "run", side_effect=logs), redirect_stdout(output):
             if fail_at in ("env-cancel", "runtime"):
                 errors = io.StringIO()
                 host_open = open
@@ -838,6 +859,7 @@ class MigrationFixture(unittest.TestCase):
         self.assertEqual(file_digests(self.donor), before)
         self.assertEqual({str(path.relative_to(self.donor)): stat.S_IMODE(path.stat().st_mode)
                           for path in self.donor.rglob("*") if not path.is_symlink()}, before_modes)
+        state["output"] = output.getvalue()
         return wizard, calls, state
 
     def assert_default_ton_image(self, machine, architecture):
@@ -860,6 +882,93 @@ class MigrationFixture(unittest.TestCase):
 
     def test_enter_accepts_arm64_ton_image_on_arm64(self):
         self.assert_default_ton_image("ARM64", "arm64")
+
+    def test_fixed_container_name_and_project_keep_artifact_storage_independent(self):
+        wizard, calls, _ = self.exercise_wizard()
+        self.assertEqual(wizard.project, "mytonctrl")
+        self.assertEqual(wizard.compose[:4], ["docker", "compose", "--project-name", "mytonctrl"])
+        override = json.loads((wizard.root / "deployment/migration.override.json").read_text())
+        self.assertEqual(override["services"]["mytonctrl"]["container_name"], "mytonctrl")
+        env = self.wizard.parse_env((wizard.root / "deployment/.env").read_text())
+        artifact = env["TON_ARTIFACTS_VOLUME"]
+        scripts = env["TON_SCRIPTS_VOLUME"]
+        unused_work = env["TON_WORK_VOLUME"]
+        self.assertEqual(len({artifact, scripts, unused_work}), 3)
+        self.assertNotIn(artifact, ("mytonctrl-artifacts", "mytonctrl-ton-artifacts"))
+        self.assertNotIn(scripts, ("mytonctrl-scripts", "mytonctrl-ton-scripts"))
+        checks = [index for index, call in enumerate(calls)
+                  if call[:3] == ["docker", "container", "ls"] and "name=^/mytonctrl$" in call]
+        pull = next(index for index, call in enumerate(calls) if call[len(wizard.compose):] == ["pull"])
+        stop = next(index for index, call in enumerate(calls) if call[:2] == ["docker", "stop"])
+        start = next(index for index, call in enumerate(calls) if call[len(wizard.compose):][:1] == ["up"])
+        self.assertEqual(len(checks), 3)
+        self.assertLess(checks[0], pull)
+        self.assertTrue(any(pull < index < stop for index in checks))
+        self.assertTrue(any(stop < index < start for index in checks))
+
+    def test_fixed_name_or_existing_project_refuses_before_pulls_or_donor_downtime(self):
+        original_root, original_donor = self.root, self.donor
+        try:
+            for collision in ("name", "container", "network", "volume"):
+                with self.subTest(existing_resource=collision):
+                    self.root = original_root / ("collision-" + collision)
+                    self.root.mkdir()
+                    self.donor = self.root / "donor"
+                    self.donor.mkdir()
+                    wizard, calls, state = self.exercise_wizard(fail_at="deployment-collision",
+                                                              deployment_collision=collision)
+                    self.assertIsNone(wizard.root)
+                    self.assertFalse(wizard.donor_stopped)
+                    self.assertFalse(wizard.destination_attempted)
+                    self.assertFalse(state["pulled"])
+                    self.assertTrue(state["writer_running"])
+                    self.assertTrue(state["container_running"])
+                    self.assertFalse(any(call[:2] == ["docker", "compose"]
+                                         or call[:2] in (["docker", "stop"], ["docker", "update"], ["docker", "cp"])
+                                         or call[-2:-1] == ["stop"] for call in calls))
+        finally:
+            self.root, self.donor = original_root, original_donor
+
+    def test_completion_and_rollback_instructions_include_both_console_commands(self):
+        wizard, _, state = self.exercise_wizard()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            wizard.rollback_instructions()
+        recovery = output.getvalue()
+        console = "sudo " + shlex.join(wizard.compose + ["exec", "mytonctrl", "mytonctrl"])
+        direct = "sudo docker exec -it mytonctrl mytonctrl"
+        self.assertIn("Console: " + console, recovery)
+        self.assertIn("Direct console: " + direct, recovery)
+        self.assertIn("Console: " + console, state["output"])
+        self.assertIn("Direct console: " + direct, state["output"])
+        self.assertIn(shlex.join(wizard.compose), state["output"])
+        self.assertIn("Review status", state["output"])
+        self.assertEqual(shlex.split(console)[1:], wizard.compose + ["exec", "mytonctrl", "mytonctrl"])
+        self.assertIn("Logs: sudo " + shlex.join(wizard.compose + ["logs", "--tail", "100"]), recovery)
+        self.assertIn("Rollback: sudo bash " + shlex.quote(str(wizard.root / "rollback.sh")), recovery)
+
+    def test_new_name_collision_is_rechecked_before_donor_stop_and_destination_start(self):
+        original_root, original_donor = self.root, self.donor
+        try:
+            for check in (2, 3):
+                with self.subTest(collision_on_check=check):
+                    self.root = original_root / ("late-collision-" + str(check))
+                    self.root.mkdir()
+                    self.donor = self.root / "donor"
+                    self.donor.mkdir()
+                    wizard, calls, state = self.exercise_wizard(fail_at="late-deployment-collision",
+                                                              deployment_collision=("name", check))
+                    self.assertTrue(state["pulled"])
+                    self.assertFalse(wizard.destination_attempted)
+                    self.assertEqual(wizard.donor_stopped, check == 3)
+                    self.assertEqual(state["writer_running"], check == 2)
+                    self.assertEqual(state["container_running"], check == 2)
+                    self.assertFalse(any(call[:2] == ["docker", "compose"]
+                                         and "up" in call[len(wizard.compose):] for call in calls))
+                    self.assertFalse(any(call[:2] == ["docker", "compose"]
+                                         and "stop" in call[len(wizard.compose):] for call in calls))
+        finally:
+            self.root, self.donor = original_root, original_donor
 
     def test_cancelled_directory_creation_does_not_pull_images_or_modify_the_donor(self):
         wizard, calls, state = self.exercise_wizard(fail_at="directory-cancel")

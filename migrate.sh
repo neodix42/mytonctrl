@@ -481,7 +481,7 @@ class Wizard:
         self.destination_attempted = False
         self.compose = []
         self.compose_env = None
-        self.project = ''
+        self.project = 'mytonctrl'
         self.settings = {}
         self.docker_root = None
         self.docker_volumes = None
@@ -513,7 +513,7 @@ class Wizard:
         return self.ask('Existing ton-docker-ctrl container name or ID', preferred['Names'])
 
     def select_destination(self, mount_sources):
-        requested = self.ask('New migration directory on the mounted data disk', '/mnt/ton/mytonctrl-migration')
+        requested = self.ask('New migration directory on the mounted data disk', str(Path.cwd() / 'migration'))
         path = ensure_destination_isolated(requested, mount_sources, require_parent=False)
         if not path.exists():
             self.confirm(f'Specified directory does not exist: {path}. Create it (including missing parents)?')
@@ -524,6 +524,19 @@ class Wizard:
 
     def compose_run(self, args, capture=False):
         return run(self.compose + args, capture=capture, env=self.compose_env)
+
+    def check_deployment_available(self):
+        # Fixed names must never attach this migration to another deployment.
+        label = 'label=com.docker.compose.project=' + self.project
+        checks = (
+            ('container named mytonctrl', ['docker', 'container', 'ls', '--all', '--filter', 'name=^/mytonctrl$', '--format', '{{.ID}}']),
+            ('Compose project container', ['docker', 'container', 'ls', '--all', '--filter', label, '--format', '{{.ID}}']),
+            ('Compose project volume', ['docker', 'volume', 'ls', '--filter', label, '--format', '{{.Name}}']),
+            ('Compose project network', ['docker', 'network', 'ls', '--filter', label, '--format', '{{.Name}}']),
+        )
+        for resource, command in checks:
+            if run(command).strip():
+                raise MigrationError(f'An existing {resource} conflicts with the mytonctrl deployment. Resolve the name conflict before migration; existing deployments were not changed.')
 
     def journal(self, phase):
         if self.root and self.root.is_dir() and (phase == 'prepared' or (self.root / 'migration.json').is_file()):
@@ -545,6 +558,8 @@ class Wizard:
         print(f'Migration files: {self.root}')
         if self.compose:
             print('Logs: sudo ' + shlex.join(self.compose + ['logs', '--tail', '100']))
+            print('Console: sudo ' + shlex.join(self.compose + ['exec', 'mytonctrl', 'mytonctrl']))
+            print('Direct console: sudo docker exec -it mytonctrl mytonctrl')
         print('Rollback: sudo bash ' + shlex.quote(str(self.root / 'rollback.sh')))
         print('Before rollback, reconcile any election/stake/wallet transactions broadcast by the new controller.')
 
@@ -621,6 +636,7 @@ class Wizard:
         for required in ('/var/ton-work', '/usr/local/bin/mytoncore', '/usr/local/bin/mytonctrl'):
             if not any(item['Destination'].rstrip('/') == required and Path(item['Source']).is_dir() for item in mounts):
                 raise MigrationError(f'Missing standard donor mount {required}; custom layouts require review.')
+        self.check_deployment_available()
         old_env = parse_env('\n'.join(inspected['Config'].get('Env') or []))
         print('Inspecting the running node and controller; large file inventories may take time...')
         probe = self.probe()
@@ -677,11 +693,11 @@ class Wizard:
                        'aarch64': 'ghcr.io/ton-blockchain/ton:v2026.08-arm64',
                        'arm64': 'ghcr.io/ton-blockchain/ton:v2026.08-arm64'}.get(platform.machine().lower())
         ton_image = self.image('Official TON image (choose a compatible tag for this host; upgrade separately)', ton_default)
-        self.project = 'mytonctrl-migrated-' + time.strftime('%Y%m%d%H%M%S') + '-' + str(os.getpid())
+        storage = 'mytonctrl-' + time.strftime('%Y%m%d%H%M%S') + '-' + str(os.getpid())
         self.settings.update(MYTONCTRL_IMAGE=controller_image, TON_IMAGE=ton_image,
                              TON_WORK_HOST_DIR=str(self.root / 'ton-work'),
-                             TON_ARTIFACTS_VOLUME=self.project + '-artifacts', TON_SCRIPTS_VOLUME=self.project + '-scripts',
-                             TON_WORK_VOLUME=self.project + '-unused-work')
+                             TON_ARTIFACTS_VOLUME=storage + '-artifacts', TON_SCRIPTS_VOLUME=storage + '-scripts',
+                             TON_WORK_VOLUME=storage + '-unused-work')
         # Restoring an existing collator must not invoke SetupCollator, which
         # creates another ADNL key/registration even when a backup is supplied.
         install_mode = 'none' if self.settings['MODE'] == 'collator' else self.settings['MODE']
@@ -730,6 +746,7 @@ class Wizard:
         print('Rechecking current source sizes and free space before stopping the original node...')
         self.log_bytes = self.measure_logs()
         self.check_space(self.probe())
+        self.check_deployment_available()
         # Once stopping begins, errors leave the donor stopped; restarting is an explicit rollback.
         self.donor_stopped = True
         self.journal('stopping-donor')
@@ -774,6 +791,7 @@ class Wizard:
         self.journal('copied-and-validated')
         self.confirm('Offline copy and keys verified. Start the new node now?')
         self.check_space(offline, phase='startup')
+        self.check_deployment_available()
         self.destination_attempted = True
         self.journal('starting-destination')
         self.compose_run(['up', '-d', '--no-build', '--pull', 'never'])
@@ -853,7 +871,8 @@ class Wizard:
         finally:
             Path(temporary).unlink(missing_ok=True)
         (deployment / 'compose.yml').write_text(compose)
-        override = {'services': {'mytonctrl': {'volumes': [{'type': 'bind', 'source': str(self.root / 'backup.tar.gz'),
+        override = {'services': {'mytonctrl': {'container_name': 'mytonctrl',
+                                              'volumes': [{'type': 'bind', 'source': str(self.root / 'backup.tar.gz'),
                                                           'target': '/migration/backup.tar.gz', 'read_only': True,
                                                           'bind': {'create_host_path': False}}]}}}
         (deployment / 'migration.override.json').write_text(json.dumps(override, indent=2))

@@ -179,6 +179,13 @@ asks for a dedicated destination on your data disk, creates its deployment
 directory automatically, and requests confirmation before stopping the old
 node and before starting the replacement.
 
+The suggested migration directory is `<current-directory>/migration`. You can
+choose another empty directory on your mounted data disk. Compose files are
+stored in its `deployment` subdirectory; the copied node data is in `ton-work`.
+The Compose project and controller container are both named `mytonctrl`.
+The wizard stops if that container name or project already exists, preserving
+the existing deployment. Artifact volumes still have independent names.
+
 It downloads `.env.example` and generates `<migration-directory>/deployment/.env`.
 If the destination already contains only `deployment/.env`, the wizard asks before
 replacing it and saves the original as `.env.before-migration`. Declining cancels
@@ -194,7 +201,15 @@ It then:
 3. Downloads this repository's `.env.example` and Compose file, configures the
    new deployment, and imports the saved identities and controller settings.
 4. Checks the backup, configuration and copied key files, then starts the new
-   node after confirmation and prints status and rollback commands.
+   node after confirmation and prints status, console and rollback commands.
+
+To open the migrated console, use the printed Compose command ending in
+`exec mytonctrl mytonctrl`, which includes both configuration files. You can
+also use the fixed container name directly:
+
+```sh
+sudo docker exec -it mytonctrl mytonctrl
+```
 
 The migration retains the blockchain database, archive history and cached
 downloads; it does **not** request another dump download. The original data
