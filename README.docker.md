@@ -174,6 +174,11 @@ asks for a dedicated destination on your data disk, creates its deployment
 directory automatically, and requests confirmation before stopping the old
 node and before starting the replacement.
 
+It downloads `.env.example` and generates `<migration-directory>/deployment/.env`.
+If the destination already contains only `deployment/.env`, the wizard asks before
+replacing it and saves the original as `.env.before-migration`. Declining cancels
+migration before stopping the old node. Your current directory's `.env` is untouched.
+
 It then:
 
 1. Disables the old container's

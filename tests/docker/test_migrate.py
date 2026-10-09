@@ -401,7 +401,8 @@ class MigrationFixture(unittest.TestCase):
                 exec(compile(self.wizard.SOURCE_PROBE, "donor-probe", "exec"), {})
         self.assertEqual(file_digests(self.donor), before)
 
-    def exercise_wizard(self, fail_at=None, core_update=None, node_update=None, restart_policy=None):
+    def exercise_wizard(self, fail_at=None, core_update=None, node_update=None, restart_policy=None,
+                        existing_env=None, env_consent="yes"):
         """Run the real workflow, substituting only host tools and image processes."""
         self.create_legacy_data()
         latest_core = {**copy.deepcopy(self.core), **(core_update or {})}
@@ -414,9 +415,13 @@ class MigrationFixture(unittest.TestCase):
         before_modes = {str(path.relative_to(self.donor)): stat.S_IMODE(path.stat().st_mode)
                         for path in self.donor.rglob("*") if not path.is_symlink()}
         migration = self.root / "automatic-migration"
-        wizard = self.wizard.Wizard(tty=io.StringIO(
-            "original-node\n" + str(migration) + "\n\n\nyes\nyes\nyes\n"
-        ))
+        answers = ["original-node", str(migration), "", "", "yes"]
+        if existing_env is not None:
+            (migration / "deployment").mkdir(parents=True)
+            (migration / "deployment/.env").write_bytes(existing_env)
+            answers.append(env_consent)
+        answers.extend(("yes", "yes"))
+        wizard = self.wizard.Wizard(tty=io.StringIO("\n".join(answers) + "\n"))
         command = ["/usr/bin/ton/validator-engine/validator-engine", "--threads", "127",
                    "--global-config", "/usr/bin/ton/global.config.json", "--db", "/var/ton-work/db",
                    "--archive-ttl", "86400", "--state-ttl", "3600", "-M"]
@@ -552,7 +557,13 @@ class MigrationFixture(unittest.TestCase):
                 mock.patch.object(self.wizard, "run", side_effect=run), \
                 mock.patch.object(self.wizard.time, "sleep", side_effect=AssertionError("Unexpected service wait")), \
                 mock.patch.object(self.wizard.subprocess, "run", side_effect=logs), redirect_stdout(io.StringIO()):
-            if fail_at:
+            if fail_at == "env-cancel":
+                with mock.patch.object(self.wizard, "Wizard", return_value=wizard), \
+                        mock.patch("builtins.open", return_value=wizard.tty), \
+                        mock.patch.object(sys, "argv", ["migrate.sh"]), \
+                        mock.patch.object(self.wizard.signal, "signal"), redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.wizard.main(), 1)
+            elif fail_at:
                 with self.assertRaises(self.wizard.MigrationError):
                     wizard.execute()
             else:
@@ -849,6 +860,142 @@ class MigrationFixture(unittest.TestCase):
         with mock.patch.object(self.wizard.subprocess, "Popen", return_value=process):
             with self.assertRaises(self.wizard.MigrationError):
                 wizard.measure_logs()
+
+    def environment_writer(self, name, consent):
+        wizard = self.wizard.Wizard(tty=io.StringIO(consent))
+        wizard.root = self.root / name
+        (wizard.root / "deployment").mkdir(parents=True)
+        wizard.root.chmod(0o750)
+        (wizard.root / "deployment").chmod(0o755)
+        wizard.project = "environment-consent-test"
+        wizard.settings = {"MYTONCTRL_IMAGE": "selected:new", "TON_WORK_HOST_DIR": str(wizard.root / "ton-work")}
+        original = b"SECRET=original-value\r\nLITERAL=$HOME\r\n"
+        path = wizard.root / "deployment/.env"
+        path.write_bytes(original)
+        path.chmod(0o640)
+        return wizard, path, original
+
+    def test_existing_environment_requires_explicit_yes_including_default_and_eof(self):
+        for index, answer in enumerate(("no\n", "\n", "")):
+            with self.subTest(answer=repr(answer)):
+                wizard, path, original = self.environment_writer(f"cancel-{index}", answer)
+                output = io.StringIO()
+                with redirect_stdout(output), self.assertRaises(self.wizard.MigrationError):
+                    wizard.write_deployment("MYTONCTRL_IMAGE=template:image\n", "services: {}\n")
+                self.assertIn(str(path), output.getvalue())
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+                self.assertEqual(stat.S_IMODE(wizard.root.stat().st_mode), 0o750)
+                self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o755)
+                self.assertEqual({child.name for child in path.parent.iterdir()}, {".env"})
+                self.assertFalse((wizard.root / "migration.json").exists())
+
+    def test_confirmed_environment_replacement_is_atomic_private_and_backed_up(self):
+        wizard, path, original = self.environment_writer("accept", "yes\n")
+        original_inode = path.stat().st_ino
+        caller_env = self.root / ".env"
+        caller_env.write_text("CALLER_CONFIGURATION=untouched\n")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            wizard.write_deployment("MYTONCTRL_IMAGE=template:image\n", "services: {}\n")
+        self.assertIn(str(path), output.getvalue())
+        self.assertEqual(self.wizard.parse_env(path.read_text())["MYTONCTRL_IMAGE"], "selected:new")
+        self.assertNotEqual(path.stat().st_ino, original_inode)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(wizard.root.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+        backup = path.with_name(".env.before-migration")
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+        self.assertEqual(caller_env.read_text(), "CALLER_CONFIGURATION=untouched\n")
+        self.assertFalse(any(child.name.startswith(".env.") and child.name != backup.name
+                             for child in path.parent.iterdir()))
+
+    def test_environment_backup_uses_unique_names_and_never_replaces_existing_backups(self):
+        wizard, path, original = self.environment_writer("backup-collision", "yes\n")
+        first = path.with_name(".env.before-migration")
+        second = path.with_name(".env.before-migration.1")
+        first.write_bytes(b"older backup zero")
+        second.write_bytes(b"older backup one")
+        with redirect_stdout(io.StringIO()):
+            wizard.write_deployment("MYTONCTRL_IMAGE=template:image\n", "services: {}\n")
+        self.assertEqual(first.read_bytes(), b"older backup zero")
+        self.assertEqual(second.read_bytes(), b"older backup one")
+        third = path.with_name(".env.before-migration.2")
+        self.assertEqual(third.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(third.stat().st_mode), 0o600)
+
+    def test_destination_accepts_an_empty_directory_or_only_deployment_and_regular_environment(self):
+        for name, contents in (("empty", None), ("deployment-only", "deployment"), ("environment-only", ".env")):
+            with self.subTest(contents=contents):
+                destination = self.root / name
+                destination.mkdir()
+                if contents:
+                    (destination / "deployment").mkdir()
+                if contents == ".env":
+                    (destination / "deployment/.env").write_text("EXISTING=configuration\n")
+                before = file_digests(destination)
+                self.assertEqual(self.wizard.ensure_destination_isolated(destination, [self.donor]), destination.resolve())
+                self.assertEqual(file_digests(destination), before)
+
+    def test_destination_refuses_node_data_prior_state_compose_and_linked_environments(self):
+        invalid = ("ton-work/data", "legacy/data", "migration.json", "backup.tar.gz",
+                   "deployment/compose.yml", "deployment/compose.yaml", "deployment/unexpected", ".env")
+        for index, name in enumerate(invalid):
+            with self.subTest(contents=name):
+                destination = self.root / f"unexpected-{index}"
+                path = destination / name
+                path.parent.mkdir(parents=True)
+                path.write_text("original contents\n")
+                before = file_digests(destination)
+                with self.assertRaises(self.wizard.MigrationError):
+                    self.wizard.ensure_destination_isolated(destination, [self.donor])
+                self.assertEqual(file_digests(destination), before)
+        for index, kind in enumerate(("deployment symlink", "env symlink", "env hardlink")):
+            with self.subTest(link=kind):
+                destination = self.root / f"linked-{index}"
+                destination.mkdir()
+                target = self.root / f"link-target-{index}"
+                if kind == "deployment symlink":
+                    target.mkdir()
+                    (destination / "deployment").symlink_to(target, target_is_directory=True)
+                else:
+                    (destination / "deployment").mkdir()
+                    target.write_text("external configuration\n")
+                    if kind == "env symlink":
+                        (destination / "deployment/.env").symlink_to(target)
+                    else:
+                        os.link(target, destination / "deployment/.env")
+                with self.assertRaises(self.wizard.MigrationError):
+                    self.wizard.ensure_destination_isolated(destination, [self.donor])
+                if target.is_file():
+                    self.assertEqual(target.read_text(), "external configuration\n")
+
+    def test_cancelled_environment_replacement_never_pulls_stops_or_creates_migration_state(self):
+        original = b"EXISTING_DEPLOYMENT=preserved\n"
+        wizard, calls, state = self.exercise_wizard(fail_at="env-cancel", existing_env=original, env_consent="no")
+        self.assertEqual((wizard.root / "deployment/.env").read_bytes(), original)
+        self.assertFalse((wizard.root / "migration.json").exists())
+        self.assertFalse((wizard.root / "legacy").exists())
+        self.assertFalse(wizard.donor_stopped)
+        self.assertTrue(state["writer_running"])
+        self.assertTrue(state["container_running"])
+        self.assertFalse(state["pulled"])
+        self.assertFalse(any(call[:2] == ["docker", "stop"] or call[:2] == ["docker", "update"]
+                             or call[-2:-1] == ["stop"] for call in calls))
+
+    def test_accepted_existing_environment_completes_migration_and_keeps_original_backup(self):
+        original = b"PREVIOUS_DEPLOYMENT=preserved\r\n"
+        wizard, _, state = self.exercise_wizard(existing_env=original, env_consent="yes")
+        deployment = wizard.root / "deployment"
+        self.assertEqual((deployment / ".env.before-migration").read_bytes(), original)
+        self.assertEqual(stat.S_IMODE((deployment / ".env.before-migration").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(deployment.stat().st_mode), 0o700)
+        self.assertEqual(self.wizard.parse_env((deployment / ".env").read_text())["NETWORK"], "mainnet")
+        self.assertEqual(json.loads((wizard.root / "migration.json").read_text())["phase"], "verified")
+        self.assertTrue(state["pulled"])
+        self.assertFalse(state["container_running"])
+        self.assertTrue((wizard.root / "ton-work/controller/initialized.json").is_file())
 
 
 if __name__ == "__main__":
