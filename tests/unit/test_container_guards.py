@@ -35,14 +35,22 @@ def test_container_marker_survives_environment_reset(monkeypatch):
     assert utils.is_container()
 
 
-@pytest.mark.parametrize("method,image", [("Update", "MyTonCtrl"), ("Upgrade", "TON")])
-def test_updates_refer_to_images_before_git_or_compiler_checks(container, monkeypatch, capsys, method, image):
+@pytest.mark.parametrize("method,image,setting", [
+    ("Update", "MyTonCtrl", "MYTONCTRL_IMAGE"),
+    ("Upgrade", "TON binaries", "TON_IMAGE"),
+])
+def test_updates_refer_to_images_before_git_or_compiler_checks(container, monkeypatch, capsys, method, image, setting):
     monkeypatch.setattr("modules.general.check_git", forbidden)
     monkeypatch.setattr("modules.general.get_clang_major_version", forbidden)
     monkeypatch.setattr("modules.general.run_as_root", forbidden)
-    module = GeneralModule(SimpleNamespace(get_paths=forbidden), None)
+    monkeypatch.setattr("modules.general.get_package_resource_path", forbidden)
+    monkeypatch.setattr("builtins.input", forbidden)
+    module = GeneralModule(SimpleNamespace(get_paths=forbidden), SimpleNamespace(exit=forbidden))
     getattr(module, method)(["some-repository", "some-branch"])
-    assert image in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert f"The {method.lower()} command is disabled inside this container." in output
+    assert f"Update {image} using the appropriate Docker image" in output
+    assert f"({setting} in .env)" in output
 
 
 def test_startup_update_check_does_not_access_repositories(container, monkeypatch):

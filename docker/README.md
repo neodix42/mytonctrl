@@ -176,9 +176,10 @@ Local development builds use the checkout's `compose.yaml`; see
 
 The helper refreshes the packaged exporter script for future TON exports.
 Persisted node and controller data are reused. Console `update` and `upgrade`
-explain this image-based workflow. No in-container TON or MyTonCtrl upgrade
-downloads, cloning or binary compilation take place. Old exported TON releases are retained; clean them up
-only when they are no longer needed.
+are disabled and display instructions to update the corresponding Docker image.
+No in-container TON or MyTonCtrl upgrade downloads, cloning or binary compilation
+take place. Old exported TON releases are retained; clean them up only when they
+are no longer needed.
 
 Git is available for MyTonCtrl's existing optional contract downloads (legacy
 nominator pools and liquid staking). It is never used to install or upgrade

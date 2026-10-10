@@ -1308,7 +1308,11 @@ class GeneralModule(MtcModule):
 
     def Update(self, args: list[str]):
         if is_container():
-            color_print("Replace the MyTonCtrl image with a newer tagged image to update the controller.")
+            color_print(
+                "The update command is disabled inside this container. "
+                "Update MyTonCtrl using the appropriate Docker image "
+                "(MYTONCTRL_IMAGE in .env) and recreate the container."
+            )
             return
         repo = "mytonctrl"
         paths = self.ton.get_paths()
@@ -1343,7 +1347,11 @@ class GeneralModule(MtcModule):
 
     def Upgrade(self, args: list[str]):
         if is_container():
-            color_print("Update the separate TON image and publish its binaries to the mounted volume. TON is not built inside the MyTonCtrl container.")
+            color_print(
+                "The upgrade command is disabled inside this container. "
+                "Update TON binaries using the appropriate Docker image "
+                "(TON_IMAGE in .env), export the binaries and restart the MyTonCtrl container."
+            )
             return
         paths = self.ton.get_paths()
 

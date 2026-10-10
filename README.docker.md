@@ -560,8 +560,9 @@ during initialization resumes the original installation using its saved settings
 it does not select a newer dump or discard the existing archive.
 Recreation also adopts the currently exported TON release. Use these image
 updates for container deployments; the console's `update` and `upgrade` commands
-refer to this workflow. A container restart alone does not replace its controller
-image or reload `.env` changes.
+are disabled and display instructions to update the corresponding Docker image.
+A container restart alone does not replace its controller image or reload `.env`
+changes.
 
 ## Use Docker without Compose
 
